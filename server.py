@@ -37,6 +37,7 @@ log = logging.getLogger("memory-server")
 DATA_DIR = Path(os.environ.get("MEMORY_DATA_DIR", "/home/kidemon/.hermes/memory-gateway/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DATA_DIR / "memory.db"
+KEY_FILE = DATA_DIR / ".api_key"
 
 # ── Database ─────────────────────────────────────────────
 
@@ -234,7 +235,52 @@ app = FastAPI(
 
 # ── API Key Auth ────────────────────────────────────────
 
-API_KEY = os.environ.get("MEMORY_API_KEY", "")
+def _generate_api_key() -> str:
+    """Generate a cryptographically secure random API key."""
+    import secrets
+    return "sk-mg-" + secrets.token_urlsafe(36)
+
+def _load_api_key() -> str:
+    """Load API key: env var > file > auto-generate and persist.
+
+    Priority:
+    1. MEMORY_API_KEY environment variable (highest)
+    2. /data/.api_key file on disk
+    3. Auto-generate, save to file, print to log (bootstrapping)
+    """
+    # 1. Environment variable (explicit override)
+    env_key = os.environ.get("MEMORY_API_KEY", "").strip()
+    if env_key:
+        log.info("Using API key from MEMORY_API_KEY environment variable")
+        return env_key
+
+    # 2. Persistent key file (survives restarts)
+    if KEY_FILE.exists():
+        file_key = KEY_FILE.read_text().strip()
+        if file_key:
+            log.info("Using API key from %s (%s...)", KEY_FILE, file_key[:16])
+            return file_key
+
+    # 3. Auto-generate (first run / bootstrap)
+    new_key = _generate_api_key()
+    KEY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    KEY_FILE.write_text(new_key)
+    # Restrict permissions so only the server user can read it
+    try:
+        os.chmod(KEY_FILE, 0o600)
+    except Exception:
+        pass
+    log.warning("=" * 64)
+    log.warning("  FIRST RUN — Auto-generated API Key:")
+    log.warning("  %s", new_key)
+    log.warning("  Saved to: %s", KEY_FILE)
+    log.warning("  Check `docker logs memory-gateway` to retrieve it.")
+    log.warning("=" * 64)
+    return new_key
+
+# ── Runtime API key (loaded at import time) ─────────────
+
+API_KEY = _load_api_key()
 
 
 @app.middleware("http")
@@ -260,9 +306,9 @@ async def startup() -> None:
         init_db(db)
     log.info("Database ready at %s", DB_PATH)
     if API_KEY:
-        log.info("API Key authentication enabled")
+        log.info("API Key authentication enabled (key starts with: %s...)", API_KEY[:16])
     else:
-        log.warning("No MEMORY_API_KEY set — server is open to all requests")
+        log.warning("No API key configured — server is open to all requests")
 
 
 # ── Health ───────────────────────────────────────────────
@@ -288,10 +334,17 @@ async def index() -> str:
   .stat strong {{ color: #00d4ff; }} code {{ background: #16213e; padding: 2px 6px; border-radius: 4px; font-size: 14px; }}
   a {{ color: #00d4ff; }} table {{ border-collapse: collapse; width: 100%; }}
   th, td {{ padding: 8px 12px; text-align: left; border-bottom: 1px solid #333; }}
+  .nav {{ margin-bottom: 24px; }}
+  .nav a {{ color: #00d4ff; text-decoration: none; margin-right: 20px; padding: 6px 14px; background: #16213e; border-radius: 6px; }}
+  .nav a:hover {{ background: #1f3460; }}
 </style></head>
 <body>
 <h1>Memory Gateway v4</h1>
-<div class="stat">Status: <strong>{'running'}</strong></div>
+<div class="nav">
+  <a href="/">Home</a>
+  <a href="/admin">Admin</a>
+</div>
+<div class="stat">Status: <strong>running</strong></div>
 <div class="stat">Total memories: <strong>{stats['total']}</strong></div>
 <div class="stat">Active: <strong>{stats['active']}</strong> | Archived: <strong>{stats['archived']}</strong></div>
 <div class="stat">By source: {json.dumps(stats['by_source'])}</div>
@@ -662,6 +715,208 @@ async def batch_save(req: BatchSaveRequest) -> dict:
             ids.append(memory_id)
 
     return {"success": True, "saved": saved, "skipped": skipped, "ids": ids}
+
+
+# ── Admin Endpoints ──────────────────────────────────────
+
+
+@app.get("/admin", response_class=HTMLResponse)
+async def admin_page(request: Request) -> str:
+    """Admin management page for API key operations."""
+    # Mask the key: show first 16 + last 4 chars only
+    masked = API_KEY[:16] + "..." + API_KEY[-4:] if len(API_KEY) > 24 else "****"
+    return f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>Admin — Memory Gateway v4</title>
+<style>
+  body {{ font-family: -apple-system, sans-serif; max-width: 700px; margin: 40px auto; padding: 0 20px; color: #e0e0e0; background: #1a1a2e; }}
+  h1 {{ color: #00d4ff; }}
+  .section {{ margin: 20px 0; padding: 20px; background: #16213e; border-radius: 8px; border-left: 3px solid #00d4ff; }}
+  .section h3 {{ margin-top: 0; color: #00d4ff; }}
+  code {{ background: #0d1117; padding: 3px 8px; border-radius: 4px; font-size: 14px; word-break: break-all; }}
+  .key-display {{ font-family: monospace; background: #0d1117; padding: 10px 16px; border-radius: 6px; word-break: break-all; color: #58a6ff; font-size: 13px; }}
+  button {{ background: #00d4ff; color: #1a1a2e; border: none; padding: 10px 20px; border-radius: 6px; cursor: pointer; font-size: 14px; font-weight: bold; margin-right: 8px; }}
+  button.danger {{ background: #ff4757; color: #fff; }}
+  button:hover {{ opacity: 0.85; }}
+  input {{ background: #0d1117; color: #e0e0e0; border: 1px solid #333; padding: 8px 12px; border-radius: 6px; width: 100%; font-size: 14px; }}
+  .toast {{ position: fixed; top: 20px; right: 20px; padding: 12px 20px; border-radius: 8px; color: #fff; font-weight: bold; display: none; z-index: 999; }}
+  .toast.success {{ background: #2ed573; color: #1a1a2e; }}
+  .toast.error {{ background: #ff4757; }}
+  .nav {{ margin-bottom: 24px; }}
+  .nav a {{ color: #00d4ff; text-decoration: none; margin-right: 20px; padding: 6px 14px; background: #16213e; border-radius: 6px; }}
+  .nav a:hover {{ background: #1f3460; }}
+</style></head>
+<body>
+<div class="nav">
+  <a href="/">Home</a>
+  <a href="/admin" style="background:#1f3460;">Admin</a>
+</div>
+<h1>Admin</h1>
+<div class="section">
+  <h3>Current API Key</h3>
+  <div class="key-display" id="keyDisplay">{masked}</div>
+  <p style="color:#888;font-size:13px;margin-top:8px;">The full key is stored in <code>data/.api_key</code> on the server.</p>
+</div>
+<div class="section">
+  <h3>Rotate Key</h3>
+  <p style="color:#aaa;font-size:14px;">Generate a new random key. The old key is <strong>immediately invalidated</strong>. All connected clients must update their config.</p>
+  <button id="rotateBtn" onclick="rotateKey()">Rotate Key</button>
+  <button class="danger" id="resetBtn" onclick="resetKey()">Reset + Regenerate</button>
+</div>
+<div class="section">
+  <h3>Set Custom Key</h3>
+  <p style="color:#aaa;font-size:14px;">Paste your own key (min 16 characters). This replaces the current key immediately.</p>
+  <input type="text" id="customKey" placeholder="sk-mg-your-custom-key-min-16-chars..." style="margin-bottom:10px;">
+  <button onclick="setCustomKey()">Set Custom Key</button>
+</div>
+<div id="toast" class="toast"></div>
+<script>
+const API_KEY_HINT = "{masked}";
+function showToast(msg, type) {{
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.className = 'toast ' + type;
+  t.style.display = 'block';
+  setTimeout(() => t.style.display = 'none', 4000);
+}}
+async function rotateKey() {{
+  if (!confirm('Rotate the API key? All current clients will be disconnected and must update their config.')) return;
+  try {{
+    const r = await fetch('/admin/apikey/rotate', {{method:'POST'}});
+    const d = await r.json();
+    if (r.ok) {{
+      document.getElementById('keyDisplay').textContent = d.key;
+      showToast('Key rotated! New key shown above.', 'success');
+    }} else {{
+      showToast(d.detail || 'Failed', 'error');
+    }}
+  }} catch(e) {{ showToast('Network error: ' + e.message, 'error'); }}
+}}
+async function resetKey() {{
+  if (!confirm('DELETE the current key and auto-generate a new one? This cannot be undone.')) return;
+  try {{
+    const r = await fetch('/admin/apikey/reset', {{method:'POST'}});
+    const d = await r.json();
+    if (r.ok) {{
+      document.getElementById('keyDisplay').textContent = d.key;
+      showToast('New key generated!', 'success');
+    }} else {{
+      showToast(d.detail || 'Failed', 'error');
+    }}
+  }} catch(e) {{ showToast('Network error: ' + e.message, 'error'); }}
+}}
+async function setCustomKey() {{
+  const newKey = document.getElementById('customKey').value.trim();
+  if (newKey.length < 16) {{ showToast('Key must be at least 16 characters', 'error'); return; }}
+  if (!confirm('Replace the current key with your custom key? All clients will be disconnected.')) return;
+  try {{
+    const r = await fetch('/admin/apikey/set', {{
+      method:'POST',
+      headers: {{'Content-Type':'application/json'}},
+      body: JSON.stringify({{key: newKey}})
+    }});
+    const d = await r.json();
+    if (r.ok) {{
+      document.getElementById('keyDisplay').textContent = d.masked;
+      document.getElementById('customKey').value = '';
+      showToast('Custom key set!', 'success');
+    }} else {{
+      showToast(d.detail || 'Failed', 'error');
+    }}
+  }} catch(e) {{ showToast('Network error: ' + e.message, 'error'); }}
+}}
+</script>
+</body></html>"""
+
+
+@app.get("/admin/apikey")
+async def get_apikey_info() -> dict:
+    """Return current API key info (masked)."""
+    masked = API_KEY[:16] + "..." + API_KEY[-4:] if len(API_KEY) > 24 else "****"
+    return {
+        "masked": masked,
+        "length": len(API_KEY),
+        "source": "environment" if os.environ.get("MEMORY_API_KEY", "").strip() else (
+            "file" if KEY_FILE.exists() else "auto-generated"
+        ),
+    }
+
+
+@app.post("/admin/apikey/rotate")
+async def rotate_apikey() -> dict:
+    """Generate a new API key, persist to file, and update runtime.
+
+    The old key is immediately invalidated.
+    Environment variable key cannot be rotated — set MEMORY_API_KEY to empty first.
+    """
+    global API_KEY
+
+    if os.environ.get("MEMORY_API_KEY", "").strip():
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot rotate key set via MEMORY_API_KEY env var. Unset the env var and restart, then rotate."
+        )
+
+    new_key = _generate_api_key()
+    KEY_FILE.write_text(new_key)
+    try:
+        os.chmod(KEY_FILE, 0o600)
+    except Exception:
+        pass
+    API_KEY = new_key
+    log.warning("API Key rotated — new key saved to %s", KEY_FILE)
+    return {"success": True, "key": new_key, "message": "Key rotated. All clients must update."}
+
+
+@app.post("/admin/apikey/reset")
+async def reset_apikey() -> dict:
+    """Delete the key file and auto-generate a new key."""
+    global API_KEY
+
+    if os.environ.get("MEMORY_API_KEY", "").strip():
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot reset key set via MEMORY_API_KEY env var. Unset the env var and restart."
+        )
+
+    if KEY_FILE.exists():
+        KEY_FILE.unlink()
+    new_key = _generate_api_key()
+    KEY_FILE.write_text(new_key)
+    try:
+        os.chmod(KEY_FILE, 0o600)
+    except Exception:
+        pass
+    API_KEY = new_key
+    log.warning("API Key reset — new key saved to %s", KEY_FILE)
+    return {"success": True, "key": new_key, "message": "Key reset and regenerated."}
+
+
+class SetKeyRequest(BaseModel):
+    key: str = Field(..., min_length=16, max_length=256)
+
+
+@app.post("/admin/apikey/set")
+async def set_apikey(req: SetKeyRequest) -> dict:
+    """Set a custom API key. Replaces the current key immediately."""
+    global API_KEY
+
+    if os.environ.get("MEMORY_API_KEY", "").strip():
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot override key set via MEMORY_API_KEY env var."
+        )
+
+    new_key = req.key.strip()
+    KEY_FILE.write_text(new_key)
+    try:
+        os.chmod(KEY_FILE, 0o600)
+    except Exception:
+        pass
+    API_KEY = new_key
+    masked = new_key[:16] + "..." + new_key[-4:] if len(new_key) > 24 else "****"
+    log.warning("API Key manually set — saved to %s", KEY_FILE)
+    return {"success": True, "masked": masked, "message": "Custom key set."}
 
 
 # ── Run ──────────────────────────────────────────────────
