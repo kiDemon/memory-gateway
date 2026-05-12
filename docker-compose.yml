@@ -1,9 +1,9 @@
-# ── Memory Gateway ─ Docker Compose ────────────────────
+# ── Memory Gateway v4 ─ Docker Compose ─────────────────
 # 部署到 1Panel / 阿里云:
-#   1. 上传整个 memory-gateway 目录
-#   2. 复制 .env.example 为 .env 并修改 API Key
-#   3. mkdir -p ./data && chmod 777 ./data
-#   4. docker compose up -d
+#   1. git clone https://github.com/kiDemon/memory-gateway.git
+#   2. cd memory-gateway && docker compose up -d
+#   3. docker logs memory-gateway  ← 查看自动生成的 API Key
+#   4. 防火墙放行 8650 端口
 # ─────────────────────────────────────────────────────────
 
 services:
@@ -13,8 +13,6 @@ services:
     restart: unless-stopped
     ports:
       - "${MEMORY_PORT:-8650}:8650"
-    env_file:
-      - .env
     environment:
       - MEMORY_DATA_DIR=/data
       - MEMORY_HOST=0.0.0.0
