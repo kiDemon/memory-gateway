@@ -48,7 +48,7 @@ def init_db(db: sqlite3.Connection) -> None:
     cursor = db.execute("PRAGMA table_info(memories)")
     columns = {row[1] for row in cursor.fetchall()}
     if columns and 'category_id' not in columns:
-        logger.info("Migrating: adding category_id column to memories")
+        log.info("Migrating: adding category_id column to memories")
         db.execute("ALTER TABLE memories ADD COLUMN category_id TEXT DEFAULT 'general'")
         db.commit()
 
@@ -56,7 +56,7 @@ def init_db(db: sqlite3.Connection) -> None:
     try:
         fts_info = db.execute("SELECT sql FROM sqlite_master WHERE name='memories_fts'").fetchone()
         if fts_info and 'category_id' not in fts_info[0]:
-            logger.info("Migrating: rebuilding FTS5 table with category_id")
+            log.info("Migrating: rebuilding FTS5 table with category_id")
             db.executescript("""
                 DROP TRIGGER IF EXISTS memories_ai;
                 DROP TRIGGER IF EXISTS memories_ad;
@@ -210,9 +210,9 @@ def init_db(db: sqlite3.Connection) -> None:
                 FROM memories WHERE archived = 0
             """)
             db.commit()
-            logger.info("FTS5 rebuilt from existing memories")
+            log.info("FTS5 rebuilt from existing memories")
         except Exception as e:
-            logger.warning(f"FTS5 rebuild failed: {e}")
+            log.warning(f"FTS5 rebuild failed: {e}")
 
 
 def get_db() -> sqlite3.Connection:
