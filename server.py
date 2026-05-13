@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
 # ── Logging ──────────────────────────────────────────────
@@ -283,20 +283,120 @@ def _load_api_key() -> str:
 API_KEY = _load_api_key()
 
 
+# ── Cookie-based session auth ────────────────────────────
+
+COOKIE_NAME = "memory_gateway_session"
+
+def login_page_html(error: str = "") -> str:
+    """Return a standalone login page HTML."""
+    err_block = f'<div class="error">{error}</div>' if error else ""
+    return f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>Memory Gateway — Login</title>
+<style>
+  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+  body {{ font-family: -apple-system, 'Segoe UI', sans-serif; min-height: 100vh; display: flex; align-items: center; justify-content: center; background: #0f0f23; color: #e0e0e0; }}
+  .card {{ background: #1a1a2e; border-radius: 16px; padding: 48px 40px; width: 420px; max-width: 90vw; box-shadow: 0 20px 60px rgba(0,0,0,0.5); border: 1px solid #2a2a4e; }}
+  h1 {{ color: #00d4ff; font-size: 24px; margin-bottom: 8px; }}
+  p {{ color: #888; font-size: 14px; margin-bottom: 28px; line-height: 1.6; }}
+  .error {{ background: #ff475722; color: #ff4757; border: 1px solid #ff4757; padding: 10px 14px; border-radius: 8px; font-size: 14px; margin-bottom: 20px; }}
+  label {{ display: block; font-size: 13px; color: #aaa; margin-bottom: 6px; font-weight: 600; }}
+  input[type="password"] {{ width: 100%; padding: 12px 16px; background: #0d1117; color: #e0e0e0; border: 1px solid #333; border-radius: 8px; font-size: 14px; font-family: monospace; }}
+  input[type="password"]:focus {{ outline: none; border-color: #00d4ff; }}
+  .hint {{ font-size: 12px; color: #666; margin-top: 6px; margin-bottom: 24px; }}
+  button {{ width: 100%; padding: 12px; background: #00d4ff; color: #0f0f23; border: none; border-radius: 8px; font-size: 15px; font-weight: bold; cursor: pointer; transition: opacity 0.2s; }}
+  button:hover {{ opacity: 0.9; }}
+  button:disabled {{ opacity: 0.5; cursor: not-allowed; }}
+  .footer {{ margin-top: 24px; text-align: center; font-size: 12px; color: #555; }}
+  .loader {{ display: none; width: 16px; height: 16px; border: 2px solid #0f0f23; border-top-color: transparent; border-radius: 50%; animation: spin 0.6s linear infinite; margin: 0 auto; }}
+  @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
+</style></head>
+<body>
+<div class="card">
+  <h1>Memory Gateway v4</h1>
+  <p>输入 API Key 登录管理面板。<br>首次运行请查看 <code>docker logs memory-gateway</code> 获取自动生成的密钥。</p>
+  {err_block}
+  <form id="loginForm" onsubmit="login(event)">
+    <label for="key">API Key</label>
+    <input type="password" id="key" placeholder="sk-mg-..." autofocus required>
+    <div class="hint">密钥存储在服务器 <code>data/.api_key</code> 文件中</div>
+    <button type="submit" id="loginBtn"><span id="btnText">登录</span><div class="loader" id="loader"></div></button>
+  </form>
+  <div class="footer">MCP Memory Server &mdash; 融合记忆网关</div>
+</div>
+<script>
+async function login(e) {{
+  e.preventDefault();
+  const key = document.getElementById('key').value.trim();
+  if (!key) return;
+  const btn = document.getElementById('loginBtn');
+  const txt = document.getElementById('btnText');
+  const ldr = document.getElementById('loader');
+  btn.disabled = true; txt.style.display = 'none'; ldr.style.display = 'block';
+  try {{
+    const r = await fetch('/admin/login', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{key}})
+    }});
+    const d = await r.json();
+    if (r.ok) {{
+      localStorage.setItem('memory_gateway_key', key);
+      window.location.href = '/admin';
+    }} else {{
+      document.querySelector('.error')?.remove();
+      const errDiv = document.createElement('div');
+      errDiv.className = 'error';
+      errDiv.textContent = d.detail || '密钥无效';
+      document.getElementById('loginForm').insertBefore(errDiv, document.getElementById('loginForm').firstChild);
+    }}
+  }} catch(e) {{
+    document.querySelector('.error')?.remove();
+    const errDiv = document.createElement('div');
+    errDiv.className = 'error';
+    errDiv.textContent = '网络错误: ' + e.message;
+    document.getElementById('loginForm').insertBefore(errDiv, document.getElementById('loginForm').firstChild);
+  }} finally {{
+    btn.disabled = false; txt.style.display = ''; ldr.style.display = 'none';
+  }}
+}}
+</script>
+</body></html>"""
+
+
 @app.middleware("http")
 async def api_key_middleware(request: Request, call_next):
-    # Allow health check and root page without auth
-    if request.url.path in ("/health", "/"):
+    # Allow health check without auth
+    if request.url.path == "/health":
+        return await call_next(request)
+
+    # Allow login endpoint without auth
+    if request.url.path == "/admin/login":
         return await call_next(request)
 
     if API_KEY:
+        # Check header
         key = request.headers.get("X-API-Key", "") or request.headers.get("Authorization", "").removeprefix("Bearer ")
-        if key != API_KEY:
-            return JSONResponse(
-                status_code=401,
-                content={"error": "Unauthorized", "detail": "Valid X-API-Key header required"},
-            )
+        if key == API_KEY:
+            return await call_next(request)
 
+        # Check session cookie
+        cookie_key = request.cookies.get(COOKIE_NAME, "")
+        if cookie_key and cookie_key == API_KEY:
+            return await call_next(request)
+
+        # Auth failed — return login page for browser, JSON for API
+        if request.url.path == "/" or request.url.path.startswith("/admin"):
+            return HTMLResponse(
+                status_code=401,
+                content=login_page_html(),
+            )
+        return JSONResponse(
+            status_code=401,
+            content={"error": "Unauthorized", "detail": "Valid X-API-Key header required"},
+        )
+
+    # No API key configured — open access
     return await call_next(request)
 
 
@@ -713,11 +813,34 @@ async def batch_save(req: BatchSaveRequest) -> dict:
             )
             saved += 1
             ids.append(memory_id)
-
     return {"success": True, "saved": saved, "skipped": skipped, "ids": ids}
+
+class SetKeyRequest(BaseModel):
+    key: str = Field(..., min_length=16, max_length=256)
+
+
+class LoginRequest(BaseModel):
+    key: str = Field(..., min_length=1)
 
 
 # ── Admin Endpoints ──────────────────────────────────────
+
+
+@app.post("/admin/login")
+async def admin_login(body: LoginRequest, request: Request):
+    """Validate API key and set session cookie."""
+    if API_KEY and body.key == API_KEY:
+        resp = JSONResponse({"success": True})
+        resp.set_cookie(
+            key=COOKIE_NAME,
+            value=API_KEY,
+            max_age=86400 * 30,  # 30 days
+            httponly=True,
+            samesite="lax",
+            path="/",
+        )
+        return resp
+    raise HTTPException(status_code=401, detail="密钥无效，请检查 API Key 是否正确")
 
 
 @app.get("/admin", response_class=HTMLResponse)
@@ -772,6 +895,11 @@ async def admin_page(request: Request) -> str:
 <div id="toast" class="toast"></div>
 <script>
 const API_KEY_HINT = "{masked}";
+const STORED_KEY = localStorage.getItem('memory_gateway_key');
+function authHeaders() {{
+  const k = STORED_KEY || '';
+  return k ? {{'X-API-Key': k, 'Content-Type': 'application/json'}} : {{}};
+}}
 function showToast(msg, type) {{
   const t = document.getElementById('toast');
   t.textContent = msg;
@@ -782,7 +910,7 @@ function showToast(msg, type) {{
 async function rotateKey() {{
   if (!confirm('Rotate the API key? All current clients will be disconnected and must update their config.')) return;
   try {{
-    const r = await fetch('/admin/apikey/rotate', {{method:'POST'}});
+    const r = await fetch('/admin/apikey/rotate', {{method:'POST', headers: authHeaders()}});
     const d = await r.json();
     if (r.ok) {{
       document.getElementById('keyDisplay').textContent = d.key;
@@ -795,7 +923,7 @@ async function rotateKey() {{
 async function resetKey() {{
   if (!confirm('DELETE the current key and auto-generate a new one? This cannot be undone.')) return;
   try {{
-    const r = await fetch('/admin/apikey/reset', {{method:'POST'}});
+    const r = await fetch('/admin/apikey/reset', {{method:'POST', headers: authHeaders()}});
     const d = await r.json();
     if (r.ok) {{
       document.getElementById('keyDisplay').textContent = d.key;
@@ -812,7 +940,7 @@ async function setCustomKey() {{
   try {{
     const r = await fetch('/admin/apikey/set', {{
       method:'POST',
-      headers: {{'Content-Type':'application/json'}},
+      headers: authHeaders(),
       body: JSON.stringify({{key: newKey}})
     }});
     const d = await r.json();
