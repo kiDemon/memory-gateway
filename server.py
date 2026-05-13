@@ -43,11 +43,38 @@ KEY_FILE = DATA_DIR / ".api_key"
 
 
 def init_db(db: sqlite3.Connection) -> None:
-    """Initialize schema with FTS5, triggers, and indexes."""
+    """Initialize schema with categories, FTS5, triggers, and indexes."""
     db.executescript("""
     PRAGMA journal_mode=WAL;
     PRAGMA foreign_keys=ON;
 
+    -- 分类树
+    CREATE TABLE IF NOT EXISTS categories (
+        id          TEXT PRIMARY KEY,
+        name        TEXT NOT NULL,
+        parent_id   TEXT REFERENCES categories(id),
+        icon        TEXT DEFAULT '📁',
+        sort_order  INTEGER DEFAULT 0,
+        created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    -- 预置分类（如果不存在）
+    INSERT OR IGNORE INTO categories (id, name, parent_id, icon, sort_order) VALUES
+    ('learning', '学习', NULL, '📚', 1),
+    ('life', '生活', NULL, '🏠', 2),
+    ('work', '工作', NULL, '💼', 3),
+    ('innovation', '创新', NULL, '💡', 4),
+    ('general', '通用', NULL, '📁', 0),
+    ('work_comprehensive', '综合', 'work', '📋', 1),
+    ('work_hr', '人力', 'work', '👥', 2),
+    ('work_finance', '财务', 'work', '💰', 3),
+    ('work_construction', '建设', 'work', '🏗️', 4),
+    ('work_maintenance', '维护', 'work', '🔧', 5),
+    ('work_bizdev', '行拓', 'work', '🚀', 6),
+    ('work_energy', '能源', 'work', '⚡', 7),
+    ('work_regional', '区域', 'work', '🌍', 8);
+
+    -- 记忆表
     CREATE TABLE IF NOT EXISTS memories (
         id          TEXT PRIMARY KEY,
         content     TEXT NOT NULL,
@@ -57,6 +84,7 @@ def init_db(db: sqlite3.Connection) -> None:
         priority    TEXT NOT NULL DEFAULT 'P1',
         confidence  REAL NOT NULL DEFAULT 0.8,
         tags        TEXT DEFAULT '[]',
+        category_id TEXT DEFAULT 'general',
         embedding   BLOB,
         created_at  TEXT NOT NULL,
         updated_at  TEXT NOT NULL,
@@ -82,41 +110,70 @@ def init_db(db: sqlite3.Connection) -> None:
         timestamp   TEXT NOT NULL
     );
 
+    -- 同步状态
+    CREATE TABLE IF NOT EXISTS sync_status (
+        tool        TEXT PRIMARY KEY,
+        last_sync   TEXT NOT NULL DEFAULT (datetime('now')),
+        last_beat   TEXT NOT NULL DEFAULT (datetime('now')),
+        total_syncs INTEGER DEFAULT 0,
+        last_count  INTEGER DEFAULT 0,
+        status      TEXT NOT NULL DEFAULT 'healthy'
+    );
+
+    -- 记忆关联
+    CREATE TABLE IF NOT EXISTS memory_relations (
+        source_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+        target_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+        relation  TEXT NOT NULL DEFAULT 'related_to',
+        strength  REAL DEFAULT 1.0,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        PRIMARY KEY (source_id, target_id)
+    );
+
+    -- FTS5 全文索引
     CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
         content,
+        category_id,
+        tags,
         type,
         scope,
         source,
-        tags,
         content=memories,
         content_rowid=rowid,
         tokenize='trigram'
     );
 
+    -- 触发器：插入时同步 FTS
     CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
-        INSERT INTO memories_fts(rowid, content, type, scope, source, tags)
-        VALUES (new.rowid, new.content, new.type, new.scope, new.source, new.tags);
+        INSERT INTO memories_fts(rowid, content, category_id, tags, type, scope, source)
+        VALUES (new.rowid, new.content, new.category_id, new.tags, new.type, new.scope, new.source);
     END;
 
+    -- 触发器：删除时同步 FTS
     CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
-        INSERT INTO memories_fts(memories_fts, rowid, content, type, scope, source, tags)
-        VALUES ('delete', old.rowid, old.content, old.type, old.scope, old.source, old.tags);
+        INSERT INTO memories_fts(memories_fts, rowid, content, category_id, tags, type, scope, source)
+        VALUES ('delete', old.rowid, old.content, old.category_id, old.tags, old.type, old.scope, old.source);
     END;
 
+    -- 触发器：更新时同步 FTS
     CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
-        INSERT INTO memories_fts(memories_fts, rowid, content, type, scope, source, tags)
-        VALUES ('delete', old.rowid, old.content, old.type, old.scope, old.source, old.tags);
-        INSERT INTO memories_fts(rowid, content, type, scope, source, tags)
-        VALUES (new.rowid, new.content, new.type, new.scope, new.source, new.tags);
+        INSERT INTO memories_fts(memories_fts, rowid, content, category_id, tags, type, scope, source)
+        VALUES ('delete', old.rowid, old.content, old.category_id, old.tags, old.type, old.scope, old.source);
+        INSERT INTO memories_fts(rowid, content, category_id, tags, type, scope, source)
+        VALUES (new.rowid, new.content, new.category_id, new.tags, new.type, new.scope, new.source);
     END;
 
+    -- 索引
     CREATE INDEX IF NOT EXISTS idx_memories_type ON memories(type);
     CREATE INDEX IF NOT EXISTS idx_memories_scope ON memories(scope);
     CREATE INDEX IF NOT EXISTS idx_memories_source ON memories(source);
     CREATE INDEX IF NOT EXISTS idx_memories_archived ON memories(archived);
     CREATE INDEX IF NOT EXISTS idx_memories_created ON memories(created_at);
     CREATE INDEX IF NOT EXISTS idx_memories_checksum ON memories(checksum);
+    CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category_id);
     CREATE INDEX IF NOT EXISTS idx_session_session ON session_memories(session_id);
+    CREATE INDEX IF NOT EXISTS idx_relations_source ON memory_relations(source_id);
+    CREATE INDEX IF NOT EXISTS idx_relations_target ON memory_relations(target_id);
     """)
 
 
@@ -191,9 +248,10 @@ def row_to_dict(row: sqlite3.Row) -> dict:
 class SaveRequest(BaseModel):
     content: str
     type: Optional[str] = None
-    scope: Optional[str] = Field(default="global", pattern="^(global|project|agent)$")
-    source: Optional[str] = Field(default="unknown", pattern="^(hermes|claude|workbuddy|system|unknown)$")
-    priority: Optional[str] = Field(default="P1", pattern="^(P0|P1|P2)$")
+    scope: Optional[str] = Field(default="global", pattern=r"^(global|project|agent)$")
+    source: Optional[str] = Field(default="unknown", pattern=r"^(hermes|claude|workbuddy|system|unknown)$")
+    priority: Optional[str] = Field(default="P1", pattern=r"^(P0|P1|P2)$")
+    category_id: Optional[str] = "general"
     tags: Optional[list[str]] = None
     session_id: Optional[str] = None
     id: Optional[str] = None
@@ -204,12 +262,14 @@ class UpdateRequest(BaseModel):
     type: Optional[str] = None
     scope: Optional[str] = None
     priority: Optional[str] = None
+    category_id: Optional[str] = None
     tags: Optional[list[str]] = None
     archived: Optional[bool] = None
 
 
 class SearchRequest(BaseModel):
     q: str
+    category_filter: Optional[str] = None
     scope_filter: Optional[str] = None
     source_filter: Optional[str] = None
     type_filter: Optional[str] = None
@@ -219,10 +279,38 @@ class SearchRequest(BaseModel):
 
 class ListRequest(BaseModel):
     since: Optional[str] = None
+    category_filter: Optional[str] = None
     scope_filter: Optional[str] = None
     source_filter: Optional[str] = None
     limit: int = Field(default=50, ge=1, le=200)
     include_archived: bool = False
+
+
+class CategoryRequest(BaseModel):
+    id: str
+    name: str
+    parent_id: Optional[str] = None
+    icon: Optional[str] = "📁"
+    sort_order: Optional[int] = 0
+
+
+class CategoryUpdateRequest(BaseModel):
+    name: Optional[str] = None
+    parent_id: Optional[str] = None
+    icon: Optional[str] = None
+    sort_order: Optional[int] = None
+
+
+class SyncHeartbeatRequest(BaseModel):
+    tool: str = Field(..., pattern=r"^(hermes|claude|workbuddy|system)$")
+    count: int = 0
+
+
+class RelationRequest(BaseModel):
+    source_id: str
+    target_id: str
+    relation: str = Field(default="related_to", pattern=r"^(related_to|contradicts|supports|duplicates|derived_from)$")
+    strength: float = Field(default=1.0, ge=0.0, le=1.0)
 
 
 # ── FastAPI App ──────────────────────────────────────────
@@ -424,43 +512,105 @@ async def health() -> dict:
 @app.get("/", response_class=HTMLResponse)
 async def index() -> str:
     with db_conn() as db:
-        stats = _get_stats(db)
+        stats_data = _get_stats(db)
+        # By category
+        by_category = {}
+        for row in db.execute(
+            "SELECT c.name, c.icon, COUNT(m.id) as cnt FROM categories c "
+            "LEFT JOIN memories m ON m.category_id = c.id AND m.archived = 0 "
+            "GROUP BY c.id ORDER BY c.sort_order"
+        ):
+            by_category[f"{row['icon']} {row['name']}"] = row["cnt"]
+        # By priority
+        by_priority = {}
+        for row in db.execute(
+            "SELECT priority, COUNT(*) as c FROM memories WHERE archived=0 GROUP BY priority"
+        ):
+            by_priority[row["priority"]] = row["c"]
+        # Sync status
+        sync_rows = db.execute("SELECT * FROM sync_status ORDER BY tool").fetchall()
+        sync_status = [dict(r) for r in sync_rows]
     return f"""<!DOCTYPE html>
 <html lang="zh-CN">
-<head><meta charset="utf-8"><title>Memory Gateway v4</title>
+<head><meta charset="utf-8"><title>Memory Gateway v4.1</title>
 <style>
-  body {{ font-family: -apple-system, sans-serif; max-width: 700px; margin: 40px auto; padding: 0 20px; color: #e0e0e0; background: #1a1a2e; }}
-  h1 {{ color: #00d4ff; }} .stat {{ margin: 12px 0; padding: 12px 16px; background: #16213e; border-radius: 8px; }}
-  .stat strong {{ color: #00d4ff; }} code {{ background: #16213e; padding: 2px 6px; border-radius: 4px; font-size: 14px; }}
-  a {{ color: #00d4ff; }} table {{ border-collapse: collapse; width: 100%; }}
-  th, td {{ padding: 8px 12px; text-align: left; border-bottom: 1px solid #333; }}
+  body {{ font-family: -apple-system, sans-serif; max-width: 900px; margin: 40px auto; padding: 0 20px; color: #e0e0e0; background: #1a1a2e; }}
+  h1 {{ color: #00d4ff; }} h2 {{ color: #58a6ff; margin-top: 30px; }}
+  .stat {{ margin: 12px 0; padding: 12px 16px; background: #16213e; border-radius: 8px; }}
+  .stat strong {{ color: #00d4ff; }}
+  .grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; margin: 16px 0; }}
+  .card {{ background: #16213e; padding: 14px; border-radius: 8px; text-align: center; }}
+  .card .num {{ font-size: 24px; font-weight: bold; color: #00d4ff; }}
+  .card .label {{ font-size: 13px; color: #888; margin-top: 4px; }}
   .nav {{ margin-bottom: 24px; }}
   .nav a {{ color: #00d4ff; text-decoration: none; margin-right: 20px; padding: 6px 14px; background: #16213e; border-radius: 6px; }}
   .nav a:hover {{ background: #1f3460; }}
+  .sync-item {{ display: flex; justify-content: space-between; padding: 8px 12px; background: #0d1117; border-radius: 6px; margin: 4px 0; }}
+  .sync-item .status {{ font-weight: bold; }}
+  .status-healthy {{ color: #2ed573; }}
+  .status-stale {{ color: #ffa502; }}
+  .status-disconnected {{ color: #ff4757; }}
+  .mcp-section {{ background: #16213e; padding: 16px; border-radius: 8px; margin: 12px 0; }}
+  code {{ background: #0d1117; padding: 2px 6px; border-radius: 4px; font-size: 13px; }}
+  table {{ border-collapse: collapse; width: 100%; }}
+  th, td {{ padding: 8px 12px; text-align: left; border-bottom: 1px solid #333; }}
 </style></head>
 <body>
-<h1>Memory Gateway v4</h1>
+<h1>Memory Gateway v4.1</h1>
 <div class="nav">
   <a href="/">Home</a>
   <a href="/admin">Admin</a>
 </div>
-<div class="stat">Status: <strong>running</strong></div>
-<div class="stat">Total memories: <strong>{stats['total']}</strong></div>
-<div class="stat">Active: <strong>{stats['active']}</strong> | Archived: <strong>{stats['archived']}</strong></div>
-<div class="stat">By source: {json.dumps(stats['by_source'])}</div>
-<div class="stat">By type: {json.dumps(stats['by_type'])}</div>
-<h2>MCP Endpoints</h2>
+
+<div class="grid">
+  <div class="card"><div class="num">{stats_data['total']}</div><div class="label">总记忆</div></div>
+  <div class="card"><div class="num">{stats_data['active']}</div><div class="label">活跃</div></div>
+  <div class="card"><div class="num">{stats_data['archived']}</div><div class="label">归档</div></div>
+  <div class="card"><div class="num">{len(sync_status)}</div><div class="label">已连接工具</div></div>
+</div>
+
+<h2>📂 分类分布</h2>
+<div class="grid">
+{''.join(f'<div class="card"><div class="num">{v}</div><div class="label">{k}</div></div>' for k, v in by_category.items() if v > 0)}
+</div>
+
+<h2>⭐ 优先级分布</h2>
+<div class="grid">
+{''.join(f'<div class="card"><div class="num">{v}</div><div class="label">{p}</div></div>' for p, v in by_priority.items())}
+</div>
+
+<h2>🔄 同步状态</h2>
+<div class="mcp-section">
+{''.join(f'<div class="sync-item"><span>{r["tool"]}</span><span class="status status-{r["status"]}">{r["status"]}</span><span>同步{r["total_syncs"]}次</span></div>' for r in sync_status) if sync_status else '<div style="color:#888;">暂无工具连接</div>'}
+</div>
+
+<h2>🔌 API 端点</h2>
+<div class="mcp-section">
+<h3>REST API</h3>
 <table>
 <tr><th>Method</th><th>Path</th><th>Description</th></tr>
-<tr><td>POST</td><td><code>/mcp/save</code></td><td>Save a memory</td></tr>
+<tr><td>POST</td><td><code>/mcp/save</code></td><td>Save memory</td></tr>
 <tr><td>POST</td><td><code>/mcp/search</code></td><td>Full-text search</td></tr>
-<tr><td>POST</td><td><code>/mcp/list</code></td><td>List recent memories</td></tr>
-<tr><td>GET</td><td><code>/mcp/get/{id}</code></td><td>Get single memory</td></tr>
-<tr><td>PUT</td><td><code>/mcp/update/{id}</code></td><td>Update a memory</td></tr>
-<tr><td>DELETE</td><td><code>/mcp/delete/{id}</code></td><td>Delete a memory</td></tr>
-<tr><td>GET</td><td><code>/mcp/stats</code></td><td>Server statistics</td></tr>
-<tr><td>GET</td><td><code>/mcp/export</code></td><td>Export all active memories as JSON</td></tr>
+<tr><td>POST</td><td><code>/mcp/list</code></td><td>List memories</td></tr>
+<tr><td>GET</td><td><code>/mcp/categories</code></td><td>Get categories</td></tr>
+<tr><td>GET</td><td><code>/mcp/stats</code></td><td>Statistics</td></tr>
+<tr><td>POST</td><td><code>/mcp/sync/heartbeat</code></td><td>Sync heartbeat</td></tr>
+<tr><td>GET</td><td><code>/mcp/sync/status</code></td><td>Sync status</td></tr>
 </table>
+<h3>MCP Protocol (JSON-RPC 2.0)</h3>
+<table>
+<tr><th>Endpoint</th><th>Methods</th></tr>
+<tr><td><code>POST /mcp</code></td><td>initialize, tools/list, tools/call, ping</td></tr>
+</table>
+</div>
+
+<h2>🛠️ 连接配置</h2>
+<div class="mcp-section">
+<p>WorkBuddy 自定义 MCP 配置：</p>
+<code>http://YOUR_SERVER:8650/mcp</code>
+<p style="color:#888;font-size:13px;margin-top:8px;">在 WorkBuddy 的自定义 MCP 设置中添加此地址</p>
+</div>
+
 </body></html>"""
 
 
@@ -474,6 +624,7 @@ async def save_memory(req: SaveRequest) -> dict:
     checksum = compute_checksum(req.content)
     mem_type = req.type or detect_type(req.content)
     tags_json = json.dumps(req.tags or [])
+    category_id = req.category_id or "general"
 
     with db_conn() as db:
         # Check duplicate
@@ -491,11 +642,11 @@ async def save_memory(req: SaveRequest) -> dict:
 
         db.execute(
             """INSERT INTO memories
-               (id, content, type, scope, source, priority, confidence, tags,
+               (id, content, type, scope, source, priority, confidence, tags, category_id,
                 created_at, updated_at, recall_count, archived, checksum)
-               VALUES (?, ?, ?, ?, ?, ?, 0.8, ?, ?, ?, 0, 0, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, 0.8, ?, ?, ?, ?, 0, 0, ?)""",
             (memory_id, req.content.strip(), mem_type, req.scope,
-             req.source, req.priority or "P1", tags_json, now, now, checksum),
+             req.source, req.priority or "P1", tags_json, category_id, now, now, checksum),
         )
 
         if req.session_id:
@@ -525,6 +676,15 @@ async def search_memory(req: SearchRequest) -> dict:
         else:
             conditions[0] = "1=1"
 
+        if req.category_filter:
+            # 支持父分类过滤：category=work 也会匹配 work_comprehensive, work_hr 等
+            if req.category_filter == "work":
+                conditions.append("(m.category_id = ? OR m.category_id LIKE ?)")
+                params.append(req.category_filter)
+                params.append("work_%")
+            else:
+                conditions.append("m.category_id=?")
+                params.append(req.category_filter)
         if req.scope_filter:
             conditions.append("m.scope=?")
             params.append(req.scope_filter)
@@ -600,6 +760,16 @@ async def list_memory(req: ListRequest) -> dict:
             conditions.append("created_at >= ?")
             params.append(req.since)
 
+        if req.category_filter:
+            # 支持父分类过滤
+            if req.category_filter == "work":
+                conditions.append("(category_id = ? OR category_id LIKE ?)")
+                params.append(req.category_filter)
+                params.append("work_%")
+            else:
+                conditions.append("category_id=?")
+                params.append(req.category_filter)
+
         if req.scope_filter:
             conditions.append("scope=?")
             params.append(req.scope_filter)
@@ -652,6 +822,9 @@ async def update_memory(memory_id: str, req: UpdateRequest) -> dict:
         if req.priority is not None:
             updates.append("priority=?")
             params.append(req.priority)
+        if req.category_id is not None:
+            updates.append("category_id=?")
+            params.append(req.category_id)
         if req.tags is not None:
             updates.append("tags=?")
             params.append(json.dumps(req.tags))
@@ -746,6 +919,456 @@ async def export_memories(scope: Optional[str] = None, source: Optional[str] = N
     return {"success": True, "count": len(rows), "memories": [row_to_dict(r) for r in rows]}
 
 
+# ── Categories ────────────────────────────────────────────
+
+
+@app.get("/mcp/categories")
+async def list_categories(parent_id: Optional[str] = None) -> dict:
+    """Get category tree. If parent_id is provided, return children of that category."""
+    with db_conn() as db:
+        if parent_id is not None:
+            rows = db.execute(
+                "SELECT * FROM categories WHERE parent_id=? ORDER BY sort_order, name",
+                (parent_id,),
+            ).fetchall()
+        else:
+            rows = db.execute(
+                "SELECT * FROM categories ORDER BY sort_order, name"
+            ).fetchall()
+    return {"success": True, "categories": [dict(r) for r in rows]}
+
+
+@app.get("/mcp/categories/{category_id}")
+async def get_category(category_id: str) -> dict:
+    """Get a single category by ID."""
+    with db_conn() as db:
+        row = db.execute("SELECT * FROM categories WHERE id=?", (category_id,)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail=f"Category {category_id} not found")
+    return {"success": True, "category": dict(row)}
+
+
+@app.post("/mcp/categories")
+async def create_category(req: CategoryRequest) -> dict:
+    """Create a new custom category."""
+    with db_conn() as db:
+        existing = db.execute("SELECT id FROM categories WHERE id=?", (req.id,)).fetchone()
+        if existing:
+            raise HTTPException(status_code=409, detail=f"Category {req.id} already exists")
+        db.execute(
+            "INSERT INTO categories (id, name, parent_id, icon, sort_order) VALUES (?, ?, ?, ?, ?)",
+            (req.id, req.name, req.parent_id, req.icon or "📁", req.sort_order or 0),
+        )
+    return {"success": True, "category": {"id": req.id, "name": req.name}}
+
+
+@app.put("/mcp/categories/{category_id}")
+async def update_category(category_id: str, req: CategoryUpdateRequest) -> dict:
+    """Update a category."""
+    with db_conn() as db:
+        existing = db.execute("SELECT id FROM categories WHERE id=?", (category_id,)).fetchone()
+        if not existing:
+            raise HTTPException(status_code=404, detail=f"Category {category_id} not found")
+        updates = []
+        params: list[Any] = []
+        if req.name is not None:
+            updates.append("name=?")
+            params.append(req.name)
+        if req.parent_id is not None:
+            updates.append("parent_id=?")
+            params.append(req.parent_id)
+        if req.icon is not None:
+            updates.append("icon=?")
+            params.append(req.icon)
+        if req.sort_order is not None:
+            updates.append("sort_order=?")
+            params.append(req.sort_order)
+        if updates:
+            sql = f"UPDATE categories SET {', '.join(updates)} WHERE id=?"
+            params.append(category_id)
+            db.execute(sql, params)
+    return {"success": True, "category_id": category_id}
+
+
+@app.delete("/mcp/categories/{category_id}")
+async def delete_category(category_id: str) -> dict:
+    """Delete a category. Memories using this category will revert to 'general'."""
+    with db_conn() as db:
+        existing = db.execute("SELECT id FROM categories WHERE id=?", (category_id,)).fetchone()
+        if not existing:
+            raise HTTPException(status_code=404, detail=f"Category {category_id} not found")
+        # Check if it's a system category
+        if category_id in ("general", "learning", "life", "work", "innovation"):
+            raise HTTPException(status_code=400, detail="Cannot delete system categories")
+        # Reassign memories to 'general'
+        db.execute("UPDATE memories SET category_id='general' WHERE category_id=?", (category_id,))
+        db.execute("DELETE FROM categories WHERE id=?", (category_id,))
+    return {"success": True, "action": "deleted", "category_id": category_id}
+
+
+# ── Sync Status ──────────────────────────────────────────
+
+
+@app.get("/mcp/sync/status")
+async def get_sync_status() -> dict:
+    """Get synchronization status for all tools."""
+    with db_conn() as db:
+        rows = db.execute("SELECT * FROM sync_status ORDER BY tool").fetchall()
+        # Also check if any tool is stale (>30 min since last beat)
+        for row in rows:
+            row_dict = dict(row)
+            try:
+                last_beat = datetime.fromisoformat(row_dict["last_beat"])
+                age_minutes = (datetime.now(timezone.utc) - last_beat).total_seconds() / 60
+                if age_minutes > 120:
+                    row_dict["status"] = "disconnected"
+                elif age_minutes > 30:
+                    row_dict["status"] = "stale"
+                else:
+                    row_dict["status"] = "healthy"
+            except Exception:
+                row_dict["status"] = "unknown"
+    return {"success": True, "sync_status": [dict(r) for r in rows]}
+
+
+@app.post("/mcp/sync/heartbeat")
+async def sync_heartbeat(req: SyncHeartbeatRequest) -> dict:
+    """Register a heartbeat from a tool. Updates sync status."""
+    now = now_iso()
+    with db_conn() as db:
+        db.execute(
+            """INSERT INTO sync_status (tool, last_sync, last_beat, total_syncs, last_count, status)
+               VALUES (?, ?, ?, 1, ?, 'healthy')
+               ON CONFLICT(tool) DO UPDATE SET
+               last_beat=excluded.last_beat,
+               total_syncs=sync_status.total_syncs+1,
+               last_count=excluded.last_count,
+               status='healthy'""",
+            (req.tool, now, now, req.count),
+        )
+    return {"success": True, "tool": req.tool, "timestamp": now}
+
+
+# ── Memory Relations ─────────────────────────────────────
+
+
+@app.post("/mcp/relations")
+async def create_relation(req: RelationRequest) -> dict:
+    """Create a relation between two memories."""
+    with db_conn() as db:
+        # Verify both memories exist
+        src = db.execute("SELECT id FROM memories WHERE id=? AND archived=0", (req.source_id,)).fetchone()
+        tgt = db.execute("SELECT id FROM memories WHERE id=? AND archived=0", (req.target_id,)).fetchone()
+        if not src:
+            raise HTTPException(status_code=404, detail=f"Source memory {req.source_id} not found")
+        if not tgt:
+            raise HTTPException(status_code=404, detail=f"Target memory {req.target_id} not found")
+        db.execute(
+            """INSERT OR REPLACE INTO memory_relations (source_id, target_id, relation, strength)
+               VALUES (?, ?, ?, ?)""",
+            (req.source_id, req.target_id, req.relation, req.strength),
+        )
+    return {"success": True, "relation": {"source": req.source_id, "target": req.target_id, "type": req.relation}}
+
+
+@app.get("/mcp/relations/{memory_id}")
+async def get_relations(memory_id: str) -> dict:
+    """Get all relations for a memory."""
+    with db_conn() as db:
+        rows = db.execute(
+            """SELECT mr.*, m.content as target_content
+               FROM memory_relations mr
+               JOIN memories m ON m.id = mr.target_id
+               WHERE mr.source_id=?
+               ORDER BY mr.strength DESC""",
+            (memory_id,),
+        ).fetchall()
+    return {"success": True, "relations": [dict(r) for r in rows]}
+
+
+@app.delete("/mcp/relations/{source_id}/{target_id}")
+async def delete_relation(source_id: str, target_id: str) -> dict:
+    """Delete a relation between two memories."""
+    with db_conn() as db:
+        db.execute(
+            "DELETE FROM memory_relations WHERE source_id=? AND target_id=?",
+            (source_id, target_id),
+        )
+    return {"success": True, "action": "deleted"}
+
+
+# ── Enhanced Stats ────────────────────────────────────────
+
+
+@app.get("/mcp/stats")
+async def stats() -> dict:
+    with db_conn() as db:
+        base_stats = _get_stats(db)
+        # By category
+        by_category = {}
+        for row in db.execute(
+            "SELECT category_id, COUNT(*) as c FROM memories WHERE archived=0 GROUP BY category_id"
+        ):
+            by_category[row["category_id"]] = row["c"]
+        # By priority
+        by_priority = {}
+        for row in db.execute(
+            "SELECT priority, COUNT(*) as c FROM memories WHERE archived=0 GROUP BY priority"
+        ):
+            by_priority[row["priority"]] = row["c"]
+        # Sync status count
+        sync_healthy = db.execute(
+            "SELECT COUNT(*) FROM sync_status WHERE status='healthy'"
+        ).fetchone()[0]
+        sync_total = db.execute("SELECT COUNT(*) FROM sync_status").fetchone()[0]
+        # Relation count
+        relation_count = db.execute("SELECT COUNT(*) FROM memory_relations").fetchone()[0]
+
+        base_stats["by_category"] = by_category
+        base_stats["by_priority"] = by_priority
+        base_stats["sync"] = {"healthy": sync_healthy, "total": sync_total}
+        base_stats["relations"] = relation_count
+    return base_stats
+
+
+# ── MCP JSON-RPC 2.0 Protocol ────────────────────────────
+
+MCP_TOOLS = [
+    {
+        "name": "mem_save",
+        "description": "保存一条记忆到记忆库。支持分类、优先级、标签等元数据。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "content": {"type": "string", "description": "记忆内容"},
+                "category_id": {"type": "string", "description": "分类ID (learning/life/work/innovation/general 或 work_* 子分类)", "default": "general"},
+                "type": {"type": "string", "enum": ["general", "rule", "preference", "decision", "context", "learning", "reference", "convention"], "default": "general"},
+                "priority": {"type": "string", "enum": ["P0", "P1", "P2"], "default": "P1"},
+                "tags": {"type": "array", "items": {"type": "string"}, "description": "自定义标签"},
+                "source": {"type": "string", "enum": ["hermes", "claude", "workbuddy", "system", "unknown"], "default": "unknown"},
+                "scope": {"type": "string", "enum": ["global", "project", "agent"], "default": "global"},
+                "session_id": {"type": "string", "description": "会话ID（可选）"}
+            },
+            "required": ["content"]
+        }
+    },
+    {
+        "name": "mem_search",
+        "description": "搜索记忆库。支持关键词、分类、标签过滤。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "搜索关键词"},
+                "category_filter": {"type": "string", "description": "分类过滤"},
+                "type_filter": {"type": "string", "description": "类型过滤"},
+                "limit": {"type": "integer", "description": "返回数量", "default": 10}
+            },
+            "required": ["query"]
+        }
+    },
+    {
+        "name": "mem_list",
+        "description": "列出记忆。支持增量同步（since参数）。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "since": {"type": "string", "description": "ISO8601 时间戳（增量同步）"},
+                "category_filter": {"type": "string", "description": "分类过滤"},
+                "limit": {"type": "integer", "description": "返回数量", "default": 50}
+            }
+        }
+    },
+    {
+        "name": "mem_delete",
+        "description": "删除一条记忆。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string", "description": "记忆ID"}
+            },
+            "required": ["id"]
+        }
+    },
+    {
+        "name": "mem_categories",
+        "description": "获取所有可用的分类列表。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {}
+        }
+    },
+    {
+        "name": "mem_stats",
+        "description": "获取记忆库统计信息。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {}
+        }
+    },
+    {
+        "name": "sync_heartbeat",
+        "description": "发送同步心跳，更新工具连接状态。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tool": {"type": "string", "enum": ["hermes", "claude", "workbuddy", "system"]},
+                "count": {"type": "integer", "description": "本次同步条数", "default": 0}
+            },
+            "required": ["tool"]
+        }
+    }
+]
+
+
+async def handle_mcp_initialize(request_id: Any, params: dict) -> dict:
+    """Handle MCP initialize request."""
+    return {
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "result": {
+            "protocolVersion": "2025-03-26",
+            "capabilities": {
+                "tools": {"listChanged": False},
+                "resources": {},
+                "prompts": {}
+            },
+            "serverInfo": {
+                "name": "memory-gateway",
+                "version": "4.1.0"
+            }
+        }
+    }
+
+
+async def handle_mcp_tools_list(request_id: Any, params: dict) -> dict:
+    """Handle tools/list request."""
+    return {
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "result": {"tools": MCP_TOOLS}
+    }
+
+
+async def handle_mcp_tools_call(request_id: Any, params: dict) -> dict:
+    """Handle tools/call request."""
+    tool_name = params.get("name", "")
+    arguments = params.get("arguments", {})
+
+    try:
+        if tool_name == "mem_save":
+            req = SaveRequest(**arguments)
+            result = await save_memory(req)
+            text = json.dumps(result, ensure_ascii=False)
+
+        elif tool_name == "mem_search":
+            search_req = SearchRequest(
+                q=arguments.get("query", arguments.get("q", "")),
+                category_filter=arguments.get("category_filter"),
+                type_filter=arguments.get("type_filter"),
+                limit=arguments.get("limit", 10),
+            )
+            result = await search_memory(search_req)
+            text = json.dumps(result, ensure_ascii=False)
+
+        elif tool_name == "mem_list":
+            list_req = ListRequest(
+                since=arguments.get("since"),
+                category_filter=arguments.get("category_filter"),
+                limit=arguments.get("limit", 50),
+            )
+            result = await list_memory(list_req)
+            text = json.dumps(result, ensure_ascii=False)
+
+        elif tool_name == "mem_delete":
+            result = await delete_memory(arguments.get("id", ""))
+            text = json.dumps(result, ensure_ascii=False)
+
+        elif tool_name == "mem_categories":
+            result = await list_categories()
+            text = json.dumps(result, ensure_ascii=False)
+
+        elif tool_name == "mem_stats":
+            result = await stats()
+            text = json.dumps(result, ensure_ascii=False)
+
+        elif tool_name == "sync_heartbeat":
+            hb_req = SyncHeartbeatRequest(
+                tool=arguments.get("tool", "unknown"),
+                count=arguments.get("count", 0),
+            )
+            result = await sync_heartbeat(hb_req)
+            text = json.dumps(result, ensure_ascii=False)
+
+        else:
+            return {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -32601, "message": f"Unknown tool: {tool_name}"}
+            }
+
+        return {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "content": [{"type": "text", "text": text}]
+            }
+        }
+
+    except Exception as e:
+        return {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "content": [{"type": "text", "text": json.dumps({"error": str(e)}, ensure_ascii=False)}],
+                "isError": True
+            }
+        }
+
+
+@app.post("/mcp")
+async def mcp_endpoint(request: Request) -> JSONResponse:
+    """MCP JSON-RPC 2.0 endpoint for protocol-compliant clients."""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(
+            status_code=400,
+            content={"jsonrpc": "2.0", "error": {"code": -32700, "message": "Parse error"}}
+        )
+
+    method = body.get("method", "")
+    request_id = body.get("id")
+    params = body.get("params", {})
+
+    # Notifications don't have an id and don't expect a response
+    if method == "notifications/initialized":
+        return JSONResponse(status_code=200, content={})
+
+    if method == "ping":
+        return JSONResponse(content={"jsonrpc": "2.0", "id": request_id, "result": {}})
+
+    if method == "initialize":
+        response = await handle_mcp_initialize(request_id, params)
+        return JSONResponse(content=response)
+
+    if method == "tools/list":
+        response = await handle_mcp_tools_list(request_id, params)
+        return JSONResponse(content=response)
+
+    if method == "tools/call":
+        response = await handle_mcp_tools_call(request_id, params)
+        return JSONResponse(content=response)
+
+    # Unknown method
+    return JSONResponse(
+        content={
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": {"code": -32601, "message": f"Method not found: {method}"}
+        }
+    )
+
+
 # ── History ──────────────────────────────────────────────
 
 
@@ -783,6 +1406,7 @@ async def batch_save(req: BatchSaveRequest) -> dict:
             checksum = compute_checksum(mem.content)
             mem_type = mem.type or detect_type(mem.content)
             tags_json = json.dumps(mem.tags or [])
+            category_id = mem.category_id or "general"
 
             existing = db.execute(
                 "SELECT id FROM memories WHERE checksum=? AND archived=0",
@@ -794,11 +1418,11 @@ async def batch_save(req: BatchSaveRequest) -> dict:
 
             db.execute(
                 """INSERT INTO memories
-                   (id, content, type, scope, source, priority, confidence, tags,
+                   (id, content, type, scope, source, priority, confidence, tags, category_id,
                     created_at, updated_at, recall_count, archived, checksum)
-                   VALUES (?, ?, ?, ?, ?, ?, 0.8, ?, ?, ?, 0, 0, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, 0.8, ?, ?, ?, ?, 0, 0, ?)""",
                 (memory_id, mem.content.strip(), mem_type, mem.scope,
-                 mem.source, mem.priority or "P1", tags_json, now, now, checksum),
+                 mem.source, mem.priority or "P1", tags_json, category_id, now, now, checksum),
             )
 
             if mem.session_id:
