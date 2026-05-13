@@ -44,6 +44,31 @@ KEY_FILE = DATA_DIR / ".api_key"
 
 def init_db(db: sqlite3.Connection) -> None:
     """Initialize schema with categories, FTS5, triggers, and indexes."""
+    # Schema migration: add category_id to old memories table if missing
+    cursor = db.execute("PRAGMA table_info(memories)")
+    columns = {row[1] for row in cursor.fetchall()}
+    if columns and 'category_id' not in columns:
+        logger.info("Migrating: adding category_id column to memories")
+        db.execute("ALTER TABLE memories ADD COLUMN category_id TEXT DEFAULT 'general'")
+        db.commit()
+
+    # Schema migration: rebuild FTS5 if old schema (no category_id)
+    try:
+        fts_info = db.execute("SELECT sql FROM sqlite_master WHERE name='memories_fts'").fetchone()
+        if fts_info and 'category_id' not in fts_info[0]:
+            logger.info("Migrating: rebuilding FTS5 table with category_id")
+            db.executescript("""
+                DROP TRIGGER IF EXISTS memories_ai;
+                DROP TRIGGER IF EXISTS memories_ad;
+                DROP TRIGGER IF EXISTS memories_au;
+                DROP TABLE IF EXISTS memories_fts;
+            """)
+            db.commit()
+            needs_fts_rebuild = True
+    except Exception:
+        pass
+    needs_fts_rebuild = locals().get('needs_fts_rebuild', False)
+
     db.executescript("""
     PRAGMA journal_mode=WAL;
     PRAGMA foreign_keys=ON;
@@ -175,6 +200,19 @@ def init_db(db: sqlite3.Connection) -> None:
     CREATE INDEX IF NOT EXISTS idx_relations_source ON memory_relations(source_id);
     CREATE INDEX IF NOT EXISTS idx_relations_target ON memory_relations(target_id);
     """)
+
+    # Rebuild FTS5 from existing data after migration
+    if needs_fts_rebuild:
+        try:
+            db.execute("""
+                INSERT INTO memories_fts(rowid, content, category_id, tags, type, scope, source)
+                SELECT rowid, content, COALESCE(category_id,'general'), tags, type, scope, source
+                FROM memories WHERE archived = 0
+            """)
+            db.commit()
+            logger.info("FTS5 rebuilt from existing memories")
+        except Exception as e:
+            logger.warning(f"FTS5 rebuild failed: {e}")
 
 
 def get_db() -> sqlite3.Connection:
