@@ -1,0 +1,402 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Memory Gateway Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+:root {
+  --bg: #0f1117; --bg2: #161822; --bg3: #1e2030;
+  --border: #2a2d3e; --text: #c0caf5; --text2: #565f89;
+  --accent: #7aa2f7; --green: #9ece6a; --red: #f7768e;
+  --yellow: #e0af68; --purple: #bb9af7; --cyan: #7dcfff;
+}
+* { margin:0; padding:0; box-sizing:border-box; }
+body { font-family: 'Segoe UI', system-ui, sans-serif; background:var(--bg); color:var(--text); }
+.header { background:var(--bg2); border-bottom:1px solid var(--border); padding:16px 24px; display:flex; align-items:center; justify-content:space-between; }
+.header h1 { font-size:20px; color:var(--accent); }
+.header .stats { display:flex; gap:24px; font-size:13px; color:var(--text2); }
+.tabs { display:flex; background:var(--bg2); border-bottom:1px solid var(--border); padding:0 24px; }
+.tab { padding:12px 20px; cursor:pointer; color:var(--text2); border-bottom:2px solid transparent; transition:all .2s; }
+.tab:hover { color:var(--text); }
+.tab.active { color:var(--accent); border-bottom-color:var(--accent); }
+.content { padding:24px; max-width:1400px; margin:0 auto; }
+.grid { display:grid; gap:16px; }
+.grid-4 { grid-template-columns: repeat(4, 1fr); }
+.grid-2 { grid-template-columns: repeat(2, 1fr); }
+.grid-3 { grid-template-columns: 2fr 1fr; }
+.card { background:var(--bg2); border:1px solid var(--border); border-radius:8px; padding:20px; }
+.card h3 { font-size:13px; color:var(--text2); margin-bottom:8px; text-transform:uppercase; letter-spacing:1px; }
+.card .num { font-size:32px; font-weight:700; color:var(--accent); }
+.card .sub { font-size:12px; color:var(--text2); margin-top:4px; }
+.chart-box { background:var(--bg2); border:1px solid var(--border); border-radius:8px; padding:16px; }
+.chart-box h3 { font-size:14px; color:var(--text); margin-bottom:12px; }
+input, select { background:var(--bg3); border:1px solid var(--border); color:var(--text); padding:8px 12px; border-radius:6px; font-size:14px; }
+input:focus, select:focus { outline:none; border-color:var(--accent); }
+.btn { background:var(--accent); color:var(--bg); border:none; padding:8px 16px; border-radius:6px; cursor:pointer; font-weight:600; }
+.btn:hover { opacity:0.9; }
+.btn.secondary { background:var(--bg3); color:var(--text); border:1px solid var(--border); }
+table { width:100%; border-collapse:collapse; }
+th { text-align:left; padding:10px 12px; font-size:12px; color:var(--text2); text-transform:uppercase; border-bottom:1px solid var(--border); }
+td { padding:10px 12px; border-bottom:1px solid var(--border); font-size:14px; }
+tr:hover { background:var(--bg3); }
+.badge { display:inline-block; padding:2px 8px; border-radius:4px; font-size:11px; font-weight:600; }
+.badge-p0 { background:rgba(247,118,142,.2); color:var(--red); }
+.badge-p1 { background:rgba(224,175,104,.2); color:var(--yellow); }
+.badge-p2 { background:rgba(122,162,247,.2); color:var(--accent); }
+.badge-hermes { background:rgba(122,162,247,.2); color:var(--accent); }
+.badge-claude { background:rgba(187,154,247,.2); color:var(--purple); }
+.badge-system { background:rgba(158,206,106,.2); color:var(--green); }
+.badge-workbuddy { background:rgba(125,207,255,.2); color:var(--cyan); }
+.badge-unknown { background:rgba(86,95,137,.2); color:var(--text2); }
+.status-ok { color:var(--green); }
+.status-warn { color:var(--yellow); }
+.detail-panel { position:fixed; right:0; top:0; width:500px; height:100vh; background:var(--bg2); border-left:1px solid var(--border); padding:24px; overflow-y:auto; transform:translateX(100%); transition:transform .3s; z-index:100; }
+.detail-panel.open { transform:translateX(0); }
+.detail-panel .close { position:absolute; top:16px; right:16px; cursor:pointer; color:var(--text2); font-size:20px; }
+.version-item { padding:12px; border-left:3px solid var(--border); margin-left:12px; margin-bottom:8px; }
+.version-item:hover { border-left-color:var(--accent); background:var(--bg3); }
+.version-item .ver { font-weight:700; color:var(--accent); }
+.version-item .meta { font-size:12px; color:var(--text2); }
+.diff-block { background:var(--bg); padding:12px; border-radius:6px; font-family:monospace; font-size:13px; white-space:pre-wrap; overflow-x:auto; margin-top:8px; }
+.diff-add { color:var(--green); }
+.diff-del { color:var(--red); }
+.loading { text-align:center; padding:40px; color:var(--text2); }
+.hidden { display:none; }
+.search-bar { display:flex; gap:8px; margin-bottom:16px; }
+.search-bar input { flex:1; }
+.pager { display:flex; justify-content:center; gap:8px; margin-top:16px; }
+.pager button { background:var(--bg3); border:1px solid var(--border); color:var(--text); padding:6px 12px; border-radius:4px; cursor:pointer; }
+.pager button.active { background:var(--accent); color:var(--bg); }
+.toast { position:fixed; top:16px; right:16px; background:var(--red); color:#fff; padding:12px 20px; border-radius:8px; font-size:14px; z-index:999; max-width:400px; box-shadow:0 4px 16px rgba(0,0,0,.3); transform:translateX(120%); transition:transform .3s; }
+.toast.show { transform:translateX(0); }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>🧠 Memory Gateway Dashboard</h1>
+  <div class="stats" id="headerStats">Loading...</div>
+</div>
+
+<div id="toast" class="toast"></div>
+
+<div class="tabs">
+  <div class="tab active" data-tab="overview">📊 总览</div>
+  <div class="tab" data-tab="memories">🔍 记忆浏览器</div>
+  <div class="tab" data-tab="evolution">🧬 进化追踪</div>
+  <div class="tab" data-tab="system">⚙️ 系统监控</div>
+</div>
+
+<!-- 总览页 -->
+<div class="content" id="tab-overview">
+  <div class="grid grid-4" id="overviewCards"></div>
+  <div style="height:16px"></div>
+  <div class="grid grid-2">
+    <div class="chart-box"><h3>📂 分类分布</h3><canvas id="chartCategory"></canvas></div>
+    <div class="chart-box"><h3>🤖 来源分布</h3><canvas id="chartSource"></canvas></div>
+  </div>
+  <div style="height:16px"></div>
+  <div class="chart-box"><h3>📈 记忆增长趋势 (30天)</h3><canvas id="chartTimeline"></canvas></div>
+</div>
+
+<!-- 记忆浏览器 -->
+<div class="content hidden" id="tab-memories">
+  <div class="search-bar">
+    <input type="text" id="searchInput" placeholder="搜索记忆...">
+    <select id="filterCategory"><option value="">全部分类</option></select>
+    <select id="filterSource">
+      <option value="">全部来源</option>
+      <option value="hermes">Hermes</option>
+      <option value="claude">Claude</option>
+      <option value="workbuddy">WorkBuddy</option>
+      <option value="system">System</option>
+    </select>
+    <select id="filterPriority">
+      <option value="">全部优先级</option>
+      <option value="P0">P0</option>
+      <option value="P1">P1</option>
+      <option value="P2">P2</option>
+    </select>
+    <button class="btn" onclick="searchMemories()">搜索</button>
+  </div>
+  <div id="memoryList"><div class="loading">加载中...</div></div>
+  <div class="pager" id="memoryPager"></div>
+</div>
+
+<!-- 进化追踪 -->
+<div class="content hidden" id="tab-evolution">
+  <div class="search-bar">
+    <input type="text" id="evolutionId" placeholder="输入记忆ID查看版本历史...">
+    <button class="btn" onclick="loadEvolution()">查看</button>
+  </div>
+  <div id="evolutionResult"></div>
+</div>
+
+<!-- 系统监控 -->
+<div class="content hidden" id="tab-system">
+  <div class="grid grid-2">
+    <div class="card" id="syncStatus"><h3>🔄 同步状态</h3><div class="loading">加载中...</div></div>
+    <div class="card" id="dbStats"><h3>💾 数据库统计</h3><div class="loading">加载中...</div></div>
+  </div>
+  <div style="height:16px"></div>
+  <div class="card" id="versionStats"><h3>🧬 版本控制统计</h3><div class="loading">加载中...</div></div>
+</div>
+
+<!-- 详情面板 -->
+<div class="detail-panel" id="detailPanel">
+  <div class="close" onclick="closeDetail()">✕</div>
+  <div id="detailContent"></div>
+</div>
+
+<script>
+const API = '';
+let charts = {};
+let currentPage = 0;
+
+// Tab 切换
+document.querySelectorAll('.tab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    document.querySelectorAll('.content').forEach(c => c.classList.add('hidden'));
+    tab.classList.add('active');
+    document.getElementById('tab-' + tab.dataset.tab).classList.remove('hidden');
+    if (tab.dataset.tab === 'overview') loadOverview();
+    if (tab.dataset.tab === 'memories') searchMemories();
+    if (tab.dataset.tab === 'system') loadSystem();
+  });
+});
+
+async function fetchJSON(url) {
+  try {
+    const r = await fetch(API + url);
+    if (!r.ok) {
+      const msg = `API ${r.status} for ${url}`;
+      console.error(msg);
+      showToast(msg);
+      return { error: `HTTP ${r.status}`, memories: [], versions: [], categories: [], sources: [], days: [] };
+    }
+    return await r.json();
+  } catch (e) {
+    const msg = `Network error for ${url}: ${e.message}`;
+    console.error(msg);
+    showToast(msg);
+    return { error: e.message, memories: [], versions: [], categories: [], sources: [], days: [] };
+  }
+}
+
+function showToast(msg) {
+  const el = document.getElementById('toast');
+  if (!el) return;
+  el.textContent = msg;
+  el.classList.add('show');
+  setTimeout(() => el.classList.remove('show'), 5000);
+}
+
+// XSS 安全的文本转义
+function escapeHtml(text) {
+  if (!text) return '';
+  const div = document.createElement('div');
+  div.textContent = text;
+  return div.innerHTML;
+}
+
+// ═══ 总览 ═══
+async function loadOverview() {
+  const d = await fetchJSON('/api/dashboard/overview');
+  document.getElementById('headerStats').innerHTML =
+    `<span>总计: ${d.total}</span><span>今日新增: ${d.today_new || 0}</span><span>版本: ${d.total_versions || 0}</span>`;
+
+  document.getElementById('overviewCards').innerHTML = [
+    { num: d.total, label: '总记忆数', sub: 'archived: ' + (d.archived||0) },
+    { num: d.today_new || 0, label: '今日新增', sub: 'active: ' + (d.active||0) },
+    { num: d.active_agents || 0, label: '活跃Agent', sub: d.by_source ? Object.keys(d.by_source).join(', ') : '-' },
+    { num: d.total_versions || 0, label: '版本总数', sub: '' },
+  ].map(c => `<div class="card"><h3>${c.label}</h3><div class="num">${c.num}</div><div class="sub">${c.sub}</div></div>`).join('');
+
+  // 分类饼图
+  if (d.by_category) {
+    const colors = ['#7aa2f7','#9ece6a','#e0af68','#f7768e','#bb9af7','#7dcfff','#ff9e64','#565f89'];
+    const entries = Object.entries(d.by_category);
+    if (charts.category) charts.category.destroy();
+    charts.category = new Chart(document.getElementById('chartCategory'), {
+      type: 'doughnut',
+      data: { labels: entries.map(e=>e[0]), datasets: [{ data: entries.map(e=>e[1]), backgroundColor: colors }] },
+      options: { plugins: { legend: { labels: { color: '#c0caf5' } } } }
+    });
+  }
+
+  // 来源柱状图
+  if (d.by_source) {
+    const entries = Object.entries(d.by_source);
+    if (charts.source) charts.source.destroy();
+    charts.source = new Chart(document.getElementById('chartSource'), {
+      type: 'bar',
+      data: { labels: entries.map(e=>e[0]), datasets: [{ label: '记忆数', data: entries.map(e=>e[1]), backgroundColor: '#7aa2f7' }] },
+      options: { plugins: { legend: { display: false } }, scales: { y: { ticks: { color: '#565f89' } }, x: { ticks: { color: '#565f89' } } } }
+    });
+  }
+
+  // 时间线
+  const tl = await fetchJSON('/api/dashboard/timeline');
+  if (tl.timeline && tl.timeline.length) {
+    if (charts.timeline) charts.timeline.destroy();
+    charts.timeline = new Chart(document.getElementById('chartTimeline'), {
+      type: 'line',
+      data: { labels: tl.timeline.map(d=>d.date.slice(5)), datasets: [{ label: '新增记忆', data: tl.timeline.map(d=>d.count), borderColor: '#7aa2f7', backgroundColor: 'rgba(122,162,247,.1)', fill: true, tension: 0.4 }] },
+      options: { plugins: { legend: { display: false } }, scales: { y: { ticks: { color: '#565f89' } }, x: { ticks: { color: '#565f89' } } } }
+    });
+  }
+}
+
+// ═══ 记忆浏览器 ═══
+async function searchMemories(page = 0) {
+  currentPage = page;
+  const q = document.getElementById('searchInput').value;
+  const cat = document.getElementById('filterCategory').value;
+  const src = document.getElementById('filterSource').value;
+  const pri = document.getElementById('filterPriority').value;
+
+  const params = new URLSearchParams({ page_size: 20, page: page + 1 });
+  if (q) params.set('q', q);
+  if (cat) params.set('category', cat);
+  if (src) params.set('source', src);
+  if (pri) params.set('priority', pri);
+
+  const d = await fetchJSON('/api/dashboard/memories?' + params);
+  const list = document.getElementById('memoryList');
+
+  if (!d.items || d.items.length === 0) {
+    list.innerHTML = '<div class="loading">无匹配记忆</div>';
+    return;
+  }
+
+  list.innerHTML = `<table>
+    <tr><th>内容</th><th>分类</th><th>来源</th><th>优先级</th><th>版本</th><th>时间</th></tr>
+    ${d.items.map(m => `<tr onclick="showDetail('${escapeHtml(m.id)}')" style="cursor:pointer">
+      <td>${escapeHtml((m.content||'').slice(0,60))}...</td>
+      <td>${m.category_id}</td>
+      <td><span class="badge badge-${m.source}">${m.source}</span></td>
+      <td><span class="badge badge-${m.priority?.toLowerCase()}">${m.priority}</span></td>
+      <td>v${m.version || 1}</td>
+      <td>${(m.created_at||'').slice(0,16)}</td>
+    </tr>`).join('')}
+  </table>`;
+
+  // 分页
+  const totalPages = d.total_pages || Math.ceil((d.total || 0) / 20);
+  const pager = document.getElementById('memoryPager');
+  pager.innerHTML = Array.from({length: Math.min(totalPages, 10)}, (_, i) =>
+    `<button class="${i===page?'active':''}" onclick="searchMemories(${i})">${i+1}</button>`
+  ).join('');
+}
+
+async function showDetail(id) {
+  const d = await fetchJSON('/api/dashboard/memories/' + id);
+  const panel = document.getElementById('detailPanel');
+  const content = document.getElementById('detailContent');
+
+  content.innerHTML = `
+    <h2 style="margin-bottom:16px;font-size:18px;">📝 记忆详情</h2>
+    <div style="background:var(--bg);padding:16px;border-radius:8px;margin-bottom:16px;">
+      <pre style="white-space:pre-wrap;font-size:14px;">${escapeHtml(d.content||'')}</pre>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:16px;">
+      <div><span style="color:var(--text2)">分类:</span> ${d.category_id}</div>
+      <div><span style="color:var(--text2)">来源:</span> ${d.source}</div>
+      <div><span style="color:var(--text2)">优先级:</span> ${d.priority}</div>
+      <div><span style="color:var(--text2)">类型:</span> ${d.type}</div>
+      <div><span style="color:var(--text2)">创建:</span> ${(d.created_at||'').slice(0,16)}</div>
+      <div><span style="color:var(--text2)">更新:</span> ${(d.updated_at||'').slice(0,16)}</div>
+    </div>
+    <h3 style="margin-bottom:12px;">版本历史</h3>
+    <div id="detailVersions"><div class="loading">加载中...</div></div>
+  `;
+  panel.classList.add('open');
+
+  // 加载版本历史
+  const v = await fetchJSON('/api/dashboard/evolution/' + id);
+  document.getElementById('detailVersions').innerHTML = (v.versions || []).map(ver => `
+    <div class="version-item">
+      <div><span class="ver">v${ver.version}</span> · ${ver.change_type} · <span class="badge badge-${ver.changed_by||'system'}">${ver.changed_by||'system'}</span></div>
+      <div class="meta">${(ver.created_at||'').slice(0,16)} · ${ver.content_hash?.slice(0,8)}</div>
+      ${ver.change_reason ? `<div class="meta">${ver.change_reason}</div>` : ''}
+    </div>
+  `).join('') || '<div style="color:var(--text2)">暂无版本记录</div>';
+}
+
+function closeDetail() { document.getElementById('detailPanel').classList.remove('open'); }
+
+// ═══ 进化追踪 ═══
+async function loadEvolution() {
+  const id = document.getElementById('evolutionId').value.trim();
+  if (!id) return;
+  const d = await fetchJSON('/api/dashboard/evolution/' + id);
+  const div = document.getElementById('evolutionResult');
+
+  if (!d.versions || d.versions.length === 0) {
+    div.innerHTML = '<div class="loading">未找到版本记录</div>';
+    return;
+  }
+
+  div.innerHTML = `<div class="card"><h3>记忆 ${id.slice(0,8)}... 的版本时间线</h3>
+    ${d.versions.map(v => `
+      <div class="version-item">
+        <div><span class="ver">v${v.version}</span> · <span class="badge badge-${v.changed_by||'system'}">${v.change_type}</span> · ${v.changed_by||'system'}</div>
+        <div class="meta">${v.created_at}</div>
+        ${v.change_reason ? `<div class="meta">${v.change_reason}</div>` : ''}
+      </div>
+    `).join('')}
+  </div>`;
+}
+
+// ═══ 系统监控 ═══
+async function loadSystem() {
+  const d = await fetchJSON('/api/dashboard/health');
+
+  document.getElementById('syncStatus').innerHTML = `<h3>🔄 同步状态</h3>
+    <table>
+      <tr><th>工具</th><th>状态</th><th>同步次数</th><th>最后心跳</th></tr>
+      ${(d.sync||[]).map(s => `<tr>
+        <td><span class="badge badge-${s.tool}">${s.tool}</span></td>
+        <td class="${s.status==='healthy'?'status-ok':'status-warn'}">${s.status}</td>
+        <td>${s.total_syncs}</td>
+        <td>${(s.last_beat||'').slice(0,16)}</td>
+      </tr>`).join('') || '<tr><td colspan="4" style="color:var(--text2)">暂无连接</td></tr>'}
+    </table>`;
+
+  document.getElementById('dbStats').innerHTML = `<h3>💾 数据库统计</h3>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px;">
+      <div>记忆总数: <strong>${d.db_stats?.total_records || 0}</strong></div>
+      <div>活跃: <strong>${d.db_stats?.active || 0}</strong></div>
+      <div>已归档: <strong>${d.db_stats?.archived || 0}</strong></div>
+      <div>DB大小: <strong>${d.db_stats?.size_mb || 0} MB</strong></div>
+    </div>`;
+
+  document.getElementById('versionStats').innerHTML = `<h3>🧬 版本控制统计</h3>
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-top:12px;">
+      <div>版本总数: <strong>${d.version_stats?.total_versions || 0}</strong></div>
+      <div>进化事件: <strong>${d.version_stats?.total_evolutions || 0}</strong></div>
+      <div>变更日志: <strong>${d.version_stats?.total_change_log || 0}</strong></div>
+    </div>`;
+}
+
+// 初始化分类筛选器
+async function initCategories() {
+  const d = await fetchJSON('/api/dashboard/categories');
+  const sel = document.getElementById('filterCategory');
+  (d||[]).forEach(c => {
+    const opt = document.createElement('option');
+    opt.value = c.id;
+    opt.textContent = c.name || c.id;
+    sel.appendChild(opt);
+  });
+}
+
+// 启动
+loadOverview();
+initCategories();
+</script>
+</body>
+</html>

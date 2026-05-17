@@ -10,17 +10,19 @@ import hashlib
 import json
 import logging
 import os
+import difflib
 import sqlite3
 import sys
 import time
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 # ── Logging ──────────────────────────────────────────────
@@ -52,6 +54,20 @@ def init_db(db: sqlite3.Connection) -> None:
         db.execute("ALTER TABLE memories ADD COLUMN category_id TEXT DEFAULT 'general'")
         db.commit()
 
+    # Schema migration: add simhash to old memories table if missing
+    if columns and 'simhash' not in columns:
+        log.info("Migrating: adding simhash column to memories")
+        db.execute("ALTER TABLE memories ADD COLUMN simhash TEXT DEFAULT ''")
+        db.commit()
+        # Backfill simhash for existing records
+        rows = db.execute("SELECT id, content FROM memories WHERE simhash='' OR simhash IS NULL").fetchall()
+        for r in rows:
+            h = compute_simhash(r[1])
+            db.execute("UPDATE memories SET simhash=? WHERE id=?", (h, r[0]))
+        if rows:
+            db.commit()
+            log.info(f"Backfilled simhash for {len(rows)} memories")
+
     # Schema migration: rebuild FTS5 if old schema (no category_id)
     try:
         fts_info = db.execute("SELECT sql FROM sqlite_master WHERE name='memories_fts'").fetchone()
@@ -72,6 +88,7 @@ def init_db(db: sqlite3.Connection) -> None:
     db.executescript("""
     PRAGMA journal_mode=WAL;
     PRAGMA foreign_keys=ON;
+    PRAGMA busy_timeout=5000;
 
     -- 分类树
     CREATE TABLE IF NOT EXISTS categories (
@@ -116,7 +133,8 @@ def init_db(db: sqlite3.Connection) -> None:
         last_recalled TEXT,
         recall_count INTEGER NOT NULL DEFAULT 0,
         archived    INTEGER NOT NULL DEFAULT 0,
-        checksum    TEXT NOT NULL
+        checksum    TEXT NOT NULL,
+        simhash     TEXT DEFAULT ''
     );
 
     CREATE TABLE IF NOT EXISTS session_memories (
@@ -199,6 +217,100 @@ def init_db(db: sqlite3.Connection) -> None:
     CREATE INDEX IF NOT EXISTS idx_session_session ON session_memories(session_id);
     CREATE INDEX IF NOT EXISTS idx_relations_source ON memory_relations(source_id);
     CREATE INDEX IF NOT EXISTS idx_relations_target ON memory_relations(target_id);
+
+    -- ═══ 记忆版本控制 (Git for Memory) ═══
+
+    -- 记忆版本表：每次修改自动创建快照
+    CREATE TABLE IF NOT EXISTS memory_versions (
+        id              TEXT PRIMARY KEY,
+        memory_id       TEXT NOT NULL,
+        version         INTEGER NOT NULL,
+        content         TEXT NOT NULL,
+        content_hash    TEXT NOT NULL,
+        diff_from_prev  TEXT,
+        change_type     TEXT NOT NULL DEFAULT 'create',
+        changed_by      TEXT DEFAULT 'system',
+        change_reason   TEXT,
+        metadata_snapshot TEXT,
+        created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY (memory_id) REFERENCES memories(id) ON DELETE CASCADE,
+        UNIQUE(memory_id, version)
+    );
+
+    -- 进化日志表：记录每次进化事件
+    CREATE TABLE IF NOT EXISTS evolution_log (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        memory_id       TEXT NOT NULL,
+        event_type      TEXT NOT NULL,
+        from_version    INTEGER,
+        to_version      INTEGER,
+        agent           TEXT,
+        details         TEXT,
+        created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY (memory_id) REFERENCES memories(id) ON DELETE CASCADE
+    );
+
+    -- 版本控制索引
+    CREATE INDEX IF NOT EXISTS idx_versions_memory ON memory_versions(memory_id, version DESC);
+    CREATE INDEX IF NOT EXISTS idx_versions_hash ON memory_versions(content_hash);
+    CREATE INDEX IF NOT EXISTS idx_evolution_memory ON evolution_log(memory_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_evolution_type ON evolution_log(event_type);
+
+    -- ═══ 记忆分支 (Git-like Branching) ═══
+    CREATE TABLE IF NOT EXISTS memory_branches (
+        id              TEXT PRIMARY KEY,
+        memory_id       TEXT NOT NULL,
+        branch_name     TEXT NOT NULL,
+        version         INTEGER NOT NULL,
+        source          TEXT DEFAULT 'system',
+        created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY (memory_id) REFERENCES memories(id) ON DELETE CASCADE,
+        UNIQUE(memory_id, branch_name)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_branches_memory ON memory_branches(memory_id);
+    CREATE INDEX IF NOT EXISTS idx_branches_name ON memory_branches(memory_id, branch_name);
+
+    -- ═══ 上下文卸载 & 4层渐进存储 ═══
+
+    -- L0 原始层：长文本原始存储，供钻回查询
+    CREATE TABLE IF NOT EXISTS raw_memories (
+        id              TEXT PRIMARY KEY,
+        session_id      TEXT,
+        source          TEXT NOT NULL DEFAULT 'unknown',
+        content         TEXT NOT NULL,
+        token_count     INTEGER NOT NULL DEFAULT 0,
+        memory_id       TEXT,
+        created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_raw_session ON raw_memories(session_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_raw_memory ON raw_memories(memory_id);
+
+    -- L2 场景层：多条记忆聚合为场景
+    CREATE TABLE IF NOT EXISTS scenarios (
+        id              TEXT PRIMARY KEY,
+        category_id     TEXT NOT NULL DEFAULT 'general',
+        title           TEXT NOT NULL,
+        summary         TEXT NOT NULL,
+        memory_ids      TEXT NOT NULL DEFAULT '[]',
+        time_window_start TEXT,
+        time_window_end   TEXT,
+        created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_scenarios_category ON scenarios(category_id, created_at DESC);
+
+    -- L3 画像层：用户/项目/领域画像
+    CREATE TABLE IF NOT EXISTS personas (
+        id              TEXT PRIMARY KEY,
+        persona_type    TEXT NOT NULL,
+        name            TEXT NOT NULL,
+        profile_md      TEXT NOT NULL DEFAULT '',
+        version         INTEGER NOT NULL DEFAULT 1,
+        created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_personas_type ON personas(persona_type, name);
     """)
 
     # Rebuild FTS5 from existing data after migration
@@ -214,17 +326,83 @@ def init_db(db: sqlite3.Connection) -> None:
         except Exception as e:
             log.warning(f"FTS5 rebuild failed: {e}")
 
+    # ═══ 版本迁移：为现有记忆创建初始版本 ═══
+    try:
+        version_count = db.execute("SELECT COUNT(*) FROM memory_versions").fetchone()[0]
+        memory_count = db.execute("SELECT COUNT(*) FROM memories WHERE archived=0").fetchone()[0]
+
+        if version_count == 0 and memory_count > 0:
+            log.info(f"Migrating: creating initial versions for {memory_count} existing memories...")
+            import uuid as _uuid
+
+            # 批量获取所有记忆
+            rows = db.execute(
+                "SELECT id, content, source, type, category_id, priority, created_at FROM memories WHERE archived=0"
+            ).fetchall()
+
+            batch_size = 500
+            for i in range(0, len(rows), batch_size):
+                batch = rows[i:i+batch_size]
+                version_values = []
+                evolution_values = []
+
+                for r in batch:
+                    version_id = str(_uuid.uuid4())
+                    content_hash = compute_checksum(r["content"])
+                    metadata = json.dumps({
+                        "type": r["type"],
+                        "category": r["category_id"],
+                        "priority": r["priority"]
+                    }, ensure_ascii=False)
+
+                    version_values.append((
+                        version_id, r["id"], 1, r["content"], content_hash,
+                        None, "create", r["source"] or "system",
+                        "Initial version (migration)", metadata, r["created_at"]
+                    ))
+
+                    evolution_values.append((
+                        r["id"], "create", 0, 1, r["source"] or "system",
+                        json.dumps({"reason": "Migration: initial version"}, ensure_ascii=False),
+                        r["created_at"]
+                    ))
+
+                db.executemany(
+                    """INSERT OR IGNORE INTO memory_versions
+                       (id, memory_id, version, content, content_hash, diff_from_prev,
+                        change_type, changed_by, change_reason, metadata_snapshot, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    version_values
+                )
+
+                db.executemany(
+                    """INSERT INTO evolution_log
+                       (memory_id, event_type, from_version, to_version, agent, details, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    evolution_values
+                )
+
+                db.commit()
+                log.info(f"  Migrated {min(i+batch_size, len(rows))}/{len(rows)} memories...")
+
+            log.info(f"Version migration complete: {len(rows)} memories now have version history")
+        elif version_count > 0:
+            log.info(f"Version tracking active: {version_count} versions for {memory_count} memories")
+    except Exception as e:
+        log.warning(f"Version migration failed (non-fatal): {e}")
+
 
 def get_db() -> sqlite3.Connection:
     db = sqlite3.connect(str(DB_PATH), timeout=10)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA journal_mode=WAL")
     db.execute("PRAGMA foreign_keys=ON")
+    db.execute("PRAGMA busy_timeout=5000")
     return db
 
 
 @contextmanager
-def db_conn():
+def db_conn() -> sqlite3.Connection:
     conn = get_db()
     try:
         yield conn
@@ -256,6 +434,82 @@ def compute_checksum(content: str) -> str:
     return hashlib.sha256(content.strip().encode()).hexdigest()[:16]
 
 
+def compute_simhash(content: str, hashbits: int = 64) -> str:
+    """Compute SimHash fingerprint for fuzzy dedup.
+
+    SimHash produces similar hashes for similar content.
+    Hamming distance < 10 means ~80%+ similarity.
+    """
+    import re
+    tokens = re.findall(r'[\w\u4e00-\u9fff]+', content.lower())
+    if not tokens:
+        return "0" * (hashbits // 4)
+    # Use shingle of 3 tokens
+    v = [0] * hashbits
+    for i in range(len(tokens) - 2):
+        shingle = tokens[i] + tokens[i+1] + tokens[i+2]
+        h = int(hashlib.md5(shingle.encode()).hexdigest(), 16)
+        for bit in range(hashbits):
+            if h & (1 << bit):
+                v[bit] += 1
+            else:
+                v[bit] -= 1
+    fingerprint = 0
+    for bit in range(hashbits):
+        if v[bit] > 0:
+            fingerprint |= (1 << bit)
+    return format(fingerprint, f'0{hashbits // 4}x')
+
+
+def hamming_distance(hash1: str, hash2: str) -> int:
+    """Compute Hamming distance between two hex hash strings."""
+    if not hash1 or not hash2:
+        return 64
+    try:
+        x = int(hash1, 16) ^ int(hash2, 16)
+        return bin(x).count('1')
+    except (ValueError, TypeError):
+        return 64
+
+
+def _find_near_duplicate(db: sqlite3.Connection, simhash: str, threshold: int = 10) -> Optional[dict]:
+    """Check if a simhash has a near-duplicate in the memories table.
+
+    Returns dict with 'id', 'content', 'simhash', 'distance', 'similarity' if found, None otherwise.
+    DRY helper used by mem_save, mem_batch_save, and batch_check endpoints.
+    """
+    similar = db.execute(
+        "SELECT id, content, simhash FROM memories WHERE archived=0 AND simhash != '' LIMIT 1000"
+    ).fetchall()
+    for r in similar:
+        if r["simhash"] and hamming_distance(simhash, r["simhash"]) < threshold:
+            return {
+                "id": r["id"],
+                "content": r.get("content", ""),
+                "simhash": r["simhash"],
+                "distance": hamming_distance(simhash, r["simhash"]),
+                "similarity": round(1.0 - hamming_distance(simhash, r["simhash"]) / 64, 3),
+            }
+    return None
+
+
+def _build_timeline(db: sqlite3.Connection, days: int = 30) -> list[dict]:
+    """Build a date-by-count timeline for the last N days.
+
+    Returns list of {date: "MM-DD", count: N} ordered ascending.
+    DRY helper used by dashboard_overview and _get_stats endpoints.
+    """
+    timeline = []
+    for i in range(days - 1, -1, -1):
+        d = datetime.now(timezone.utc) - timedelta(days=i)
+        date_str = d.strftime("%Y-%m-%d")
+        cnt = db.execute(
+            "SELECT COUNT(*) FROM memories WHERE created_at LIKE ?", (date_str + "%",)
+        ).fetchone()[0]
+        timeline.append({"date": d.strftime("%m-%d"), "count": cnt})
+    return timeline
+
+
 def detect_type(content: str) -> str:
     lower = content.lower()
     scores = {}
@@ -280,27 +534,457 @@ def row_to_dict(row: sqlite3.Row) -> dict:
     return d
 
 
+# ── Version Manager (Git for Memory) ────────────────────
+
+
+class VersionManager:
+    """记忆版本管理器 - 实现 Git for Memory 的核心功能"""
+
+    @staticmethod
+    def create_version(db: sqlite3.Connection, memory_id: str, content: str,
+                       change_type: str = "create", changed_by: str = "system",
+                       change_reason: str = None, metadata: dict = None) -> int:
+        """创建新版本快照，返回版本号（原子化版本号分配）
+
+        使用 INSERT ... SELECT MAX(version)+1 原子化分配版本号，
+        避免并发场景下 SELECT + INSERT 之间的竞态条件。
+        """
+        version_id = str(uuid.uuid4())
+        content_hash = compute_checksum(content)
+        metadata_snapshot = json.dumps(metadata or {}, ensure_ascii=False)
+        now = now_iso()
+
+        # 计算与上一个版本的 diff（仅在已有版本时）
+        diff_from_prev = None
+        prev_row = db.execute(
+            "SELECT content FROM memory_versions WHERE memory_id=? ORDER BY version DESC LIMIT 1",
+            (memory_id,)
+        ).fetchone()
+        if prev_row:
+            prev_lines = prev_row["content"].splitlines(keepends=True)
+            curr_lines = content.splitlines(keepends=True)
+            diff = list(difflib.unified_diff(prev_lines, curr_lines, lineterm=''))
+            diff_from_prev = "\n".join(diff) if diff else None
+
+        # 原子化分配版本号：用一个 INSERT 同时完成版本号计算和写入
+        # 利用 SQLite 的子查询原子性，MAX(version)+1 在 INSERT 时计算
+        try:
+            db.execute(
+                """INSERT INTO memory_versions
+                   (id, memory_id, version, content, content_hash, diff_from_prev,
+                    change_type, changed_by, change_reason, metadata_snapshot, created_at)
+                   SELECT ?, ?, COALESCE(MAX(version), 0) + 1, ?, ?, ?, ?, ?, ?, ?, ?
+                   FROM memory_versions WHERE memory_id=?""",
+                (version_id, memory_id, content, content_hash,
+                 diff_from_prev, change_type, changed_by, change_reason,
+                 metadata_snapshot, now, memory_id)
+            )
+        except sqlite3.IntegrityError:
+            # 极低概率：并发写入导致 UNIQUE(memory_id, version) 冲突，重试一次
+            log.warning(f"Version conflict for {memory_id[:8]}..., retrying...")
+            db.execute(
+                """INSERT INTO memory_versions
+                   (id, memory_id, version, content, content_hash, diff_from_prev,
+                    change_type, changed_by, change_reason, metadata_snapshot, created_at)
+                   SELECT ?, ?, COALESCE(MAX(version), 0) + 1, ?, ?, ?, ?, ?, ?, ?, ?
+                   FROM memory_versions WHERE memory_id=?""",
+                (str(uuid.uuid4()), memory_id, content, content_hash,
+                 diff_from_prev, change_type, changed_by, change_reason,
+                 metadata_snapshot, now, memory_id)
+            )
+
+        # 获取实际分配的版本号
+        row = db.execute(
+            "SELECT version FROM memory_versions WHERE id=?", (version_id,)
+        ).fetchone()
+        new_version = row["version"] if row else 1
+
+        # 记录进化日志
+        db.execute(
+            """INSERT INTO evolution_log
+               (memory_id, event_type, from_version, to_version, agent, details)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (memory_id, change_type, new_version - 1, new_version, changed_by,
+             json.dumps({"reason": change_reason, "content_hash": content_hash}, ensure_ascii=False))
+        )
+
+        log.info(f"Version {new_version} created for memory {memory_id[:8]}... ({change_type})")
+
+        # Auto-detect bad evolution after version creation
+        try:
+            bad_result = VersionManager.detect_bad_evolution(db, memory_id, new_version)
+            if bad_result.get("is_bad"):
+                log.warning(
+                    f"Bad evolution detected for memory {memory_id[:8]}... v{new_version}: "
+                    f"{bad_result.get('reasons', [])}"
+                )
+                # Record warning in evolution_log
+                db.execute(
+                    """INSERT INTO evolution_log
+                       (memory_id, event_type, from_version, to_version, agent, details)
+                       VALUES (?, 'bad_evolution_warning', ?, ?, ?, ?)""",
+                    (memory_id, new_version - 1, new_version, changed_by,
+                     json.dumps(bad_result, ensure_ascii=False))
+                )
+        except Exception as e:
+            log.debug(f"Bad evolution check skipped: {e}")
+
+        return new_version
+
+    @staticmethod
+    def get_history(db: sqlite3.Connection, memory_id: str, limit: int = 50) -> list[dict]:
+        """获取记忆的版本历史"""
+        rows = db.execute(
+            """SELECT id, version, content, content_hash, change_type, changed_by,
+                      change_reason, created_at
+               FROM memory_versions
+               WHERE memory_id=?
+               ORDER BY version DESC
+               LIMIT ?""",
+            (memory_id, limit)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    @staticmethod
+    def get_version(db: sqlite3.Connection, memory_id: str, version: int) -> Optional[dict]:
+        """获取指定版本"""
+        row = db.execute(
+            """SELECT * FROM memory_versions
+               WHERE memory_id=? AND version=?""",
+            (memory_id, version)
+        ).fetchone()
+        return dict(row) if row else None
+
+    @staticmethod
+    def get_diff(db: sqlite3.Connection, memory_id: str,
+                 version_a: int, version_b: int) -> dict:
+        """获取两个版本之间的 diff"""
+        va = VersionManager.get_version(db, memory_id, version_a)
+        vb = VersionManager.get_version(db, memory_id, version_b)
+
+        if not va or not vb:
+            return {"error": "Version not found"}
+
+        lines_a = va["content"].splitlines(keepends=True)
+        lines_b = vb["content"].splitlines(keepends=True)
+        diff = list(difflib.unified_diff(lines_a, lines_b,
+                                          fromfile=f"v{version_a}", tofile=f"v{version_b}",
+                                          lineterm=''))
+
+        return {
+            "memory_id": memory_id,
+            "version_a": version_a,
+            "version_b": version_b,
+            "diff": "\n".join(diff) if diff else "(no changes)",
+            "hash_a": va["content_hash"],
+            "hash_b": vb["content_hash"],
+        }
+
+    @staticmethod
+    def rollback(db: sqlite3.Connection, memory_id: str,
+                 target_version: int, agent: str = "system") -> dict:
+        """回滚到指定版本"""
+        target = VersionManager.get_version(db, memory_id, target_version)
+        if not target:
+            return {"error": f"Version {target_version} not found"}
+
+        # 获取当前记忆信息
+        current = db.execute(
+            "SELECT * FROM memories WHERE id=?", (memory_id,)
+        ).fetchone()
+        if not current:
+            return {"error": "Memory not found"}
+
+        # 获取当前最新版本号（从 memory_versions 表，而非 memories 表）
+        current_ver_row = db.execute(
+            "SELECT MAX(version) as v FROM memory_versions WHERE memory_id=?",
+            (memory_id,)
+        ).fetchone()
+        from_version = current_ver_row["v"] or 0
+
+        # 更新记忆内容为历史版本
+        now = now_iso()
+        db.execute(
+            """UPDATE memories
+               SET content=?, checksum=?, simhash=?, updated_at=?
+               WHERE id=?""",
+            (target["content"], target["content_hash"],
+             compute_simhash(target["content"]), now, memory_id)
+        )
+
+        # 创建新版本记录（标记为 rollback，create_version 内部会自动记录 evolution_log）
+        new_ver = VersionManager.create_version(
+            db, memory_id, target["content"],
+            change_type="rollback",
+            changed_by=agent,
+            change_reason=f"Rollback from v{from_version} to v{target_version}"
+        )
+
+        log.info(f"Memory {memory_id[:8]}... rolled back from v{from_version} to v{target_version}")
+        return {
+            "success": True,
+            "action": "rollback",
+            "memory_id": memory_id,
+            "from_version": from_version,
+            "target_version": target_version,
+            "new_version": new_ver
+        }
+
+    # ═══ Git for Memory: Branching & Multi-Agent Coordination ═══
+
+    @staticmethod
+    def create_branch(db: sqlite3.Connection, memory_id: str,
+                      branch_name: str, from_version: int = None,
+                      source: str = "system") -> dict:
+        """Create a named branch pointing to a specific version.
+
+        If from_version is None, branch from the latest version.
+        """
+        # Check memory exists
+        mem = db.execute("SELECT id FROM memories WHERE id=?", (memory_id,)).fetchone()
+        if not mem:
+            return {"error": "Memory not found"}
+
+        # Resolve from_version
+        if from_version is None:
+            row = db.execute(
+                "SELECT MAX(version) as max_ver FROM memory_versions WHERE memory_id=?",
+                (memory_id,)
+            ).fetchone()
+            from_version = row["max_ver"] or 1
+
+        # Check version exists
+        ver = db.execute(
+            "SELECT id FROM memory_versions WHERE memory_id=? AND version=?",
+            (memory_id, from_version)
+        ).fetchone()
+        if not ver:
+            return {"error": f"Version {from_version} not found"}
+
+        # Check branch name uniqueness
+        existing = db.execute(
+            "SELECT id FROM memory_branches WHERE memory_id=? AND branch_name=?",
+            (memory_id, branch_name)
+        ).fetchone()
+        if existing:
+            return {"error": f"Branch '{branch_name}' already exists"}
+
+        branch_id = str(uuid.uuid4())
+        now = now_iso()
+        db.execute(
+            """INSERT INTO memory_branches (id, memory_id, branch_name, version, source, created_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (branch_id, memory_id, branch_name, from_version, source, now)
+        )
+
+        # Log branch creation event
+        db.execute(
+            """INSERT INTO evolution_log
+               (memory_id, event_type, from_version, to_version, agent, details)
+               VALUES (?, 'branch_create', ?, ?, ?, ?)""",
+            (memory_id, 0, from_version, source,
+             json.dumps({"branch_name": branch_name}, ensure_ascii=False))
+        )
+
+        log.info(f"Branch '{branch_name}' created for memory {memory_id[:8]}... at v{from_version}")
+        return {
+            "success": True,
+            "action": "branch_create",
+            "branch_id": branch_id,
+            "memory_id": memory_id,
+            "branch_name": branch_name,
+            "version": from_version,
+        }
+
+    @staticmethod
+    def list_branches(db: sqlite3.Connection, memory_id: str) -> list[dict]:
+        """List all branches for a memory."""
+        rows = db.execute(
+            """SELECT id, memory_id, branch_name, version, source, created_at
+               FROM memory_branches
+               WHERE memory_id=?
+               ORDER BY created_at DESC""",
+            (memory_id,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    @staticmethod
+    def merge_branch(db: sqlite3.Connection, memory_id: str,
+                     source_branch: str, target_branch: str,
+                     agent: str = "system") -> dict:
+        """Merge source_branch into target_branch.
+
+        Takes the content at source_branch's version, applies it as a new version,
+        and updates the target_branch pointer.
+        """
+        src = db.execute(
+            "SELECT * FROM memory_branches WHERE memory_id=? AND branch_name=?",
+            (memory_id, source_branch)
+        ).fetchone()
+        tgt = db.execute(
+            "SELECT * FROM memory_branches WHERE memory_id=? AND branch_name=?",
+            (memory_id, target_branch)
+        ).fetchone()
+
+        if not src:
+            return {"error": f"Source branch '{source_branch}' not found"}
+        if not tgt:
+            return {"error": f"Target branch '{target_branch}' not found"}
+
+        # Get source content
+        src_ver = VersionManager.get_version(db, memory_id, src["version"])
+        if not src_ver:
+            return {"error": f"Source version {src['version']} not found"}
+
+        # Get target current content for diff
+        tgt_ver = VersionManager.get_version(db, memory_id, tgt["version"])
+        if not tgt_ver:
+            return {"error": f"Target version {tgt['version']} not found"}
+
+        # Create new version with merged content (source wins)
+        merged_content = src_ver["content"]
+        new_ver = VersionManager.create_version(
+            db, memory_id, merged_content,
+            change_type="merge",
+            changed_by=agent,
+            change_reason=f"Merge '{source_branch}' into '{target_branch}'"
+        )
+
+        # Update target branch pointer
+        db.execute(
+            "UPDATE memory_branches SET version=?, source=? WHERE id=?",
+            (new_ver, agent, tgt["id"])
+        )
+
+        # Also update the actual memory content
+        now = now_iso()
+        db.execute(
+            "UPDATE memories SET content=?, checksum=?, simhash=?, updated_at=? WHERE id=?",
+            (merged_content, compute_checksum(merged_content),
+             compute_simhash(merged_content), now, memory_id)
+        )
+
+        # Log merge event
+        db.execute(
+            """INSERT INTO evolution_log
+               (memory_id, event_type, from_version, to_version, agent, details)
+               VALUES (?, 'merge', ?, ?, ?, ?)""",
+            (memory_id, tgt["version"], new_ver, agent,
+             json.dumps({
+                 "source_branch": source_branch,
+                 "target_branch": target_branch,
+                 "source_version": src["version"],
+             }, ensure_ascii=False))
+        )
+
+        log.info(
+            f"Merged '{source_branch}' (v{src['version']}) -> '{target_branch}' "
+            f"for memory {memory_id[:8]}... -> v{new_ver}"
+        )
+        return {
+            "success": True,
+            "action": "merge",
+            "memory_id": memory_id,
+            "source_branch": source_branch,
+            "target_branch": target_branch,
+            "source_version": src["version"],
+            "new_version": new_ver,
+        }
+
+    @staticmethod
+    def detect_bad_evolution(db: sqlite3.Connection, memory_id: str,
+                             version: int) -> dict:
+        """Detect bad evolution: content catastrophic loss (>80%) or large drift (>30 bits)."""
+        curr = db.execute(
+            "SELECT content, content_hash FROM memory_versions WHERE memory_id=? AND version=?",
+            (memory_id, version)
+        ).fetchone()
+        if not curr:
+            return {"is_bad": False, "reason": "Version not found"}
+
+        prev = db.execute(
+            "SELECT content, content_hash FROM memory_versions WHERE memory_id=? AND version=?",
+            (memory_id, version - 1)
+        ).fetchone()
+        if not prev:
+            return {"is_bad": False, "reason": "No previous version to compare"}
+
+        reasons = []
+
+        # Check 1: content catastrophic loss > 80%
+        prev_len = len(prev["content"])
+        curr_len = len(curr["content"])
+        if prev_len > 100 and curr_len > 0:  # only check for non-trivial content
+            shrink_pct = (prev_len - curr_len) / prev_len * 100
+            if shrink_pct > 80:
+                reasons.append(f"Content shortened by {shrink_pct:.1f}% ({prev_len}->{curr_len} chars)")
+
+        # Check 2: SimHash drift > 30 bits (content ~53%+ different)
+        prev_hash = compute_simhash(prev["content"])
+        curr_hash = compute_simhash(curr["content"])
+        distance = hamming_distance(prev_hash, curr_hash)
+        if distance > 30:
+            reasons.append(f"SimHash drifted {distance} bits (threshold: 30)")
+
+        is_bad = len(reasons) > 0
+        return {
+            "is_bad": is_bad,
+            "memory_id": memory_id,
+            "version": version,
+            "reasons": reasons,
+            "shrink_pct": round((prev_len - curr_len) / prev_len * 100, 1) if prev_len > 0 else 0,
+            "simhash_distance": distance,
+            "prev_simhash": prev_hash,
+            "curr_simhash": curr_hash,
+        }
+
+    @staticmethod
+    def auto_rollback_if_bad(db: sqlite3.Connection, memory_id: str,
+                             version: int, agent: str = "system") -> dict:
+        """Check for bad evolution and auto-rollback if detected.
+
+        Rolls back to the previous version if bad evolution is confirmed.
+        """
+        bad_result = VersionManager.detect_bad_evolution(db, memory_id, version)
+        if not bad_result.get("is_bad"):
+            return {"rolled_back": False, "reason": "Evolution is healthy", **bad_result}
+
+        target_version = version - 1
+        rollback_result = VersionManager.rollback(db, memory_id, target_version, agent)
+
+        log.warning(
+            f"Auto-rollback for memory {memory_id[:8]}... from v{version} to v{target_version}: "
+            f"{bad_result.get('reasons', [])}"
+        )
+
+        return {
+            "rolled_back": True,
+            "reason": "Bad evolution detected",
+            "bad_evolution": bad_result,
+            "rollback": rollback_result,
+        }
+
 # ── Pydantic Models ──────────────────────────────────────
 
 
 class SaveRequest(BaseModel):
-    content: str
-    type: Optional[str] = None
+    content: str = Field(..., max_length=100000)
+    type: Optional[str] = Field(default=None, pattern=r"^(general|rule|preference|decision|context|learning|reference|convention)$")
     scope: Optional[str] = Field(default="global", pattern=r"^(global|project|agent)$")
     source: Optional[str] = Field(default="unknown", pattern=r"^(hermes|claude|workbuddy|system|unknown)$")
     priority: Optional[str] = Field(default="P1", pattern=r"^(P0|P1|P2)$")
-    category_id: Optional[str] = "general"
+    category_id: Optional[str] = Field(default="general", pattern=r"^[a-z][a-z0-9_]{0,63}$")
     tags: Optional[list[str]] = None
     session_id: Optional[str] = None
     id: Optional[str] = None
 
 
 class UpdateRequest(BaseModel):
-    content: Optional[str] = None
-    type: Optional[str] = None
-    scope: Optional[str] = None
-    priority: Optional[str] = None
-    category_id: Optional[str] = None
+    content: Optional[str] = Field(default=None, max_length=100000)
+    type: Optional[str] = Field(default=None, pattern=r"^(general|rule|preference|decision|context|learning|reference|convention)$")
+    scope: Optional[str] = Field(default=None, pattern=r"^(global|project|agent)$")
+    priority: Optional[str] = Field(default=None, pattern=r"^(P0|P1|P2)$")
+    category_id: Optional[str] = Field(default=None, pattern=r"^[a-z][a-z0-9_]{0,63}$")
     tags: Optional[list[str]] = None
     archived: Optional[bool] = None
 
@@ -349,6 +1033,16 @@ class RelationRequest(BaseModel):
     target_id: str
     relation: str = Field(default="related_to", pattern=r"^(related_to|contradicts|supports|duplicates|derived_from)$")
     strength: float = Field(default=1.0, ge=0.0, le=1.0)
+
+
+class OffloadRequest(BaseModel):
+    content: str
+    session_id: Optional[str] = None
+    source: Optional[str] = "unknown"
+
+
+class DrilldownRequest(BaseModel):
+    memory_id: str
 
 
 # ── FastAPI App ──────────────────────────────────────────
@@ -500,6 +1194,10 @@ async def api_key_middleware(request: Request, call_next):
     if request.url.path == "/admin/login":
         return await call_next(request)
 
+    # Allow dashboard and its API without auth (has its own session if needed)
+    if request.url.path == "/dashboard" or request.url.path.startswith("/api/dashboard/"):
+        return await call_next(request)
+
     if API_KEY:
         # Check header
         key = request.headers.get("X-API-Key", "") or request.headers.get("Authorization", "").removeprefix("Bearer ")
@@ -547,109 +1245,10 @@ async def health() -> dict:
     return {"status": "ok", "version": "4.0.0", "memories": count, "db": str(DB_PATH)}
 
 
-@app.get("/", response_class=HTMLResponse)
-async def index() -> str:
-    with db_conn() as db:
-        stats_data = _get_stats(db)
-        # By category
-        by_category = {}
-        for row in db.execute(
-            "SELECT c.name, c.icon, COUNT(m.id) as cnt FROM categories c "
-            "LEFT JOIN memories m ON m.category_id = c.id AND m.archived = 0 "
-            "GROUP BY c.id ORDER BY c.sort_order"
-        ):
-            by_category[f"{row['icon']} {row['name']}"] = row["cnt"]
-        # By priority
-        by_priority = {}
-        for row in db.execute(
-            "SELECT priority, COUNT(*) as c FROM memories WHERE archived=0 GROUP BY priority"
-        ):
-            by_priority[row["priority"]] = row["c"]
-        # Sync status
-        sync_rows = db.execute("SELECT * FROM sync_status ORDER BY tool").fetchall()
-        sync_status = [dict(r) for r in sync_rows]
-    return f"""<!DOCTYPE html>
-<html lang="zh-CN">
-<head><meta charset="utf-8"><title>Memory Gateway v4.1</title>
-<style>
-  body {{ font-family: -apple-system, sans-serif; max-width: 900px; margin: 40px auto; padding: 0 20px; color: #e0e0e0; background: #1a1a2e; }}
-  h1 {{ color: #00d4ff; }} h2 {{ color: #58a6ff; margin-top: 30px; }}
-  .stat {{ margin: 12px 0; padding: 12px 16px; background: #16213e; border-radius: 8px; }}
-  .stat strong {{ color: #00d4ff; }}
-  .grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; margin: 16px 0; }}
-  .card {{ background: #16213e; padding: 14px; border-radius: 8px; text-align: center; }}
-  .card .num {{ font-size: 24px; font-weight: bold; color: #00d4ff; }}
-  .card .label {{ font-size: 13px; color: #888; margin-top: 4px; }}
-  .nav {{ margin-bottom: 24px; }}
-  .nav a {{ color: #00d4ff; text-decoration: none; margin-right: 20px; padding: 6px 14px; background: #16213e; border-radius: 6px; }}
-  .nav a:hover {{ background: #1f3460; }}
-  .sync-item {{ display: flex; justify-content: space-between; padding: 8px 12px; background: #0d1117; border-radius: 6px; margin: 4px 0; }}
-  .sync-item .status {{ font-weight: bold; }}
-  .status-healthy {{ color: #2ed573; }}
-  .status-stale {{ color: #ffa502; }}
-  .status-disconnected {{ color: #ff4757; }}
-  .mcp-section {{ background: #16213e; padding: 16px; border-radius: 8px; margin: 12px 0; }}
-  code {{ background: #0d1117; padding: 2px 6px; border-radius: 4px; font-size: 13px; }}
-  table {{ border-collapse: collapse; width: 100%; }}
-  th, td {{ padding: 8px 12px; text-align: left; border-bottom: 1px solid #333; }}
-</style></head>
-<body>
-<h1>Memory Gateway v4.1</h1>
-<div class="nav">
-  <a href="/">Home</a>
-  <a href="/admin">Admin</a>
-</div>
-
-<div class="grid">
-  <div class="card"><div class="num">{stats_data['total']}</div><div class="label">总记忆</div></div>
-  <div class="card"><div class="num">{stats_data['active']}</div><div class="label">活跃</div></div>
-  <div class="card"><div class="num">{stats_data['archived']}</div><div class="label">归档</div></div>
-  <div class="card"><div class="num">{len(sync_status)}</div><div class="label">已连接工具</div></div>
-</div>
-
-<h2>📂 分类分布</h2>
-<div class="grid">
-{''.join(f'<div class="card"><div class="num">{v}</div><div class="label">{k}</div></div>' for k, v in by_category.items() if v > 0)}
-</div>
-
-<h2>⭐ 优先级分布</h2>
-<div class="grid">
-{''.join(f'<div class="card"><div class="num">{v}</div><div class="label">{p}</div></div>' for p, v in by_priority.items())}
-</div>
-
-<h2>🔄 同步状态</h2>
-<div class="mcp-section">
-{''.join(f'<div class="sync-item"><span>{r["tool"]}</span><span class="status status-{r["status"]}">{r["status"]}</span><span>同步{r["total_syncs"]}次</span></div>' for r in sync_status) if sync_status else '<div style="color:#888;">暂无工具连接</div>'}
-</div>
-
-<h2>🔌 API 端点</h2>
-<div class="mcp-section">
-<h3>REST API</h3>
-<table>
-<tr><th>Method</th><th>Path</th><th>Description</th></tr>
-<tr><td>POST</td><td><code>/mcp/save</code></td><td>Save memory</td></tr>
-<tr><td>POST</td><td><code>/mcp/search</code></td><td>Full-text search</td></tr>
-<tr><td>POST</td><td><code>/mcp/list</code></td><td>List memories</td></tr>
-<tr><td>GET</td><td><code>/mcp/categories</code></td><td>Get categories</td></tr>
-<tr><td>GET</td><td><code>/mcp/stats</code></td><td>Statistics</td></tr>
-<tr><td>POST</td><td><code>/mcp/sync/heartbeat</code></td><td>Sync heartbeat</td></tr>
-<tr><td>GET</td><td><code>/mcp/sync/status</code></td><td>Sync status</td></tr>
-</table>
-<h3>MCP Protocol (JSON-RPC 2.0)</h3>
-<table>
-<tr><th>Endpoint</th><th>Methods</th></tr>
-<tr><td><code>POST /mcp</code></td><td>initialize, tools/list, tools/call, ping</td></tr>
-</table>
-</div>
-
-<h2>🛠️ 连接配置</h2>
-<div class="mcp-section">
-<p>WorkBuddy 自定义 MCP 配置：</p>
-<code>http://YOUR_SERVER:8650/mcp</code>
-<p style="color:#888;font-size:13px;margin-top:8px;">在 WorkBuddy 的自定义 MCP 设置中添加此地址</p>
-</div>
-
-</body></html>"""
+@app.get("/")
+async def root():
+    """Redirect to the dashboard UI."""
+    return RedirectResponse(url="/dashboard", status_code=302)
 
 
 # ── MCP Endpoints ────────────────────────────────────────
@@ -660,6 +1259,7 @@ async def save_memory(req: SaveRequest) -> dict:
     memory_id = req.id or str(uuid.uuid4())
     now = now_iso()
     checksum = compute_checksum(req.content)
+    simhash = compute_simhash(req.content)
     mem_type = req.type or detect_type(req.content)
     tags_json = json.dumps(req.tags or [])
     category_id = req.category_id or "general"
@@ -678,13 +1278,33 @@ async def save_memory(req: SaveRequest) -> dict:
                 "existing_id": existing["id"],
             }
 
+        # Fuzzy dedup: check simhash for near-duplicates
+        near_dup = _find_near_duplicate(db, simhash)
+        if near_dup:
+            return {
+                "success": True,
+                "action": "skipped",
+                "reason": "near_duplicate",
+                "existing_id": near_dup["id"],
+                "similarity": near_dup["similarity"],
+            }
+
         db.execute(
-            """INSERT INTO memories
-               (id, content, type, scope, source, priority, confidence, tags, category_id,
-                created_at, updated_at, recall_count, archived, checksum)
-               VALUES (?, ?, ?, ?, ?, ?, 0.8, ?, ?, ?, ?, 0, 0, ?)""",
-            (memory_id, req.content.strip(), mem_type, req.scope,
-             req.source, req.priority or "P1", tags_json, category_id, now, now, checksum),
+           """INSERT INTO memories
+              (id, content, type, scope, source, priority, confidence, tags, category_id,
+                created_at, updated_at, recall_count, archived, checksum, simhash)
+              VALUES (?, ?, ?, ?, ?, ?, 0.8, ?, ?, ?, ?, 0, 0, ?, ?)""",
+           (memory_id, req.content.strip(), mem_type, req.scope,
+            req.source, req.priority or "P1", tags_json, category_id, now, now, checksum, simhash),
+        )
+
+        # 创建初始版本快照
+        VersionManager.create_version(
+            db, memory_id, req.content.strip(),
+            change_type="create",
+            changed_by=req.source,
+            change_reason="Initial memory creation",
+            metadata={"type": mem_type, "category": category_id, "priority": req.priority or "P1"}
         )
 
         if req.session_id:
@@ -699,6 +1319,95 @@ async def save_memory(req: SaveRequest) -> dict:
         )
 
     return {"success": True, "action": "saved", "id": memory_id, "type": mem_type}
+
+
+# ── 上下文卸载 & 4层渐进存储 ─────────────────────────────
+
+
+async def offload_memory(req: OffloadRequest) -> dict:
+    """将长文本卸载到 raw_memories (L0)，返回索引ID。"""
+    raw_id = str(uuid.uuid4())
+    token_count = len(req.content) // 4  # 粗略估算 token 数
+    now = now_iso()
+    with db_conn() as db:
+        db.execute(
+            """INSERT INTO raw_memories (id, session_id, source, content, token_count, created_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (raw_id, req.session_id, req.source, req.content, token_count, now),
+        )
+        db.commit()
+    log.info(f"Offloaded raw memory {raw_id} ({token_count} tokens)")
+    return {"success": True, "id": raw_id, "token_count": token_count}
+
+
+async def drilldown_memory(memory_id: str) -> dict:
+    """通过 ID 钻回原始内容 (L0)。"""
+    with db_conn() as db:
+        row = db.execute(
+            "SELECT id, session_id, source, content, token_count, memory_id, created_at "
+            "FROM raw_memories WHERE id=?",
+            (memory_id,),
+        ).fetchone()
+    if not row:
+        return {"success": False, "error": f"raw memory {memory_id} not found"}
+    return {
+        "success": True,
+        "id": row["id"],
+        "session_id": row["session_id"],
+        "source": row["source"],
+        "content": row["content"],
+        "token_count": row["token_count"],
+        "memory_id": row["memory_id"],
+        "created_at": row["created_at"],
+    }
+
+
+async def get_scenario(category_id: str, days: int = 7) -> dict:
+    """获取场景聚合 (L2)。按 category_id 和时间窗口查询。"""
+    with db_conn() as db:
+        rows = db.execute(
+            "SELECT id, category_id, title, summary, memory_ids, "
+            "time_window_start, time_window_end, created_at, updated_at "
+            "FROM scenarios WHERE category_id=? "
+            "ORDER BY created_at DESC LIMIT 50",
+            (category_id,),
+        ).fetchall()
+    results = []
+    for r in rows:
+        results.append({
+            "id": r["id"],
+            "category_id": r["category_id"],
+            "title": r["title"],
+            "summary": r["summary"],
+            "memory_ids": json.loads(r["memory_ids"]) if r["memory_ids"] else [],
+            "time_window_start": r["time_window_start"],
+            "time_window_end": r["time_window_end"],
+            "created_at": r["created_at"],
+            "updated_at": r["updated_at"],
+        })
+    return {"success": True, "count": len(results), "scenarios": results}
+
+
+async def get_persona(persona_type: str, name: str) -> dict:
+    """获取画像 (L3)。按 persona_type + name 查询。"""
+    with db_conn() as db:
+        row = db.execute(
+            "SELECT id, persona_type, name, profile_md, version, created_at, updated_at "
+            "FROM personas WHERE persona_type=? AND name=?",
+            (persona_type, name),
+        ).fetchone()
+    if not row:
+        return {"success": False, "error": f"persona ({persona_type}/{name}) not found"}
+    return {
+        "success": True,
+        "id": row["id"],
+        "persona_type": row["persona_type"],
+        "name": row["name"],
+        "profile_md": row["profile_md"],
+        "version": row["version"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
 
 
 @app.post("/mcp/search")
@@ -756,10 +1465,10 @@ async def search_memory(req: SearchRequest) -> dict:
                 ORDER BY fts.rank
                 LIMIT ?
             """
-            params = [fts_query] + params + [req.limit]
+            fts_params = [fts_query] + params + [req.limit]
 
             try:
-                rows = db.execute(sql, params).fetchall()
+                rows = db.execute(sql, fts_params).fetchall()
             except sqlite3.OperationalError:
                 # FTS query syntax error, fallback to LIKE
                 like_q = f"%{req.q}%"
@@ -770,15 +1479,17 @@ async def search_memory(req: SearchRequest) -> dict:
                     ORDER BY m.created_at DESC
                     LIMIT ?
                 """
-                params_fallback = [like_q] + [p for p in params[1:-1]] + [req.limit]
+                params_fallback = [like_q] + params + [req.limit]
                 rows = db.execute(sql_fallback, params_fallback).fetchall()
 
-        # Update recall stats
+        # Update recall stats (batch)
         now = now_iso()
-        for row in rows:
+        ids = [r["id"] for r in rows]
+        if ids:
+            placeholders = ",".join("?" for _ in ids)
             db.execute(
-                "UPDATE memories SET last_recalled=?, recall_count=recall_count+1 WHERE id=?",
-                (now, row["id"]),
+                f"UPDATE memories SET last_recalled=?, recall_count=recall_count+1 WHERE id IN ({placeholders})",
+                [now] + ids,
             )
 
     results = [row_to_dict(r) for r in rows]
@@ -827,6 +1538,60 @@ async def list_memory(req: ListRequest) -> dict:
     return {"success": True, "count": len(results), "results": results}
 
 
+class CheckDuplicatesRequest(BaseModel):
+    checksums: list[str] = Field(default_factory=list, description="List of SHA256 checksums to check")
+    simhashes: list[dict] = Field(default_factory=list, description="List of {content, simhash} to fuzzy-check")
+
+
+@app.post("/mcp/check-duplicates")
+async def check_duplicates(req: CheckDuplicatesRequest) -> dict:
+    """Batch check for exact and near duplicates.
+
+    Returns:
+      - exact: set of checksums already in DB
+      - near: list of {simhash, existing_id, distance} for near-duplicates
+    """
+    exact_dupes = set()
+    near_dupes = []
+
+    with db_conn() as db:
+        # Exact match: batch check checksums
+        if req.checksums:
+            placeholders = ",".join(["?"] * len(req.checksums))
+            rows = db.execute(
+                f"SELECT checksum FROM memories WHERE checksum IN ({placeholders}) AND archived=0",
+                req.checksums,
+            ).fetchall()
+            exact_dupes = {r["checksum"] for r in rows}
+
+        # Fuzzy match: check simhashes
+        if req.simhashes:
+            existing = db.execute(
+                "SELECT id, simhash FROM memories WHERE archived=0 AND simhash != '' LIMIT 1000"
+            ).fetchall()
+            for item in req.simhashes:
+                sh = item.get("simhash", "")
+                if not sh:
+                    continue
+                for r in existing:
+                    if r["simhash"]:
+                        dist = hamming_distance(sh, r["simhash"])
+                        if dist < 10:
+                            near_dupes.append({
+                                "input_simhash": sh,
+                                "existing_id": r["id"],
+                                "existing_simhash": r["simhash"],
+                                "distance": dist,
+                                "similarity": round(1.0 - dist / 64, 3),
+                            })
+                            break
+
+    return {
+        "success": True,
+        "exact": list(exact_dupes),
+        "near": near_dupes,
+    }
+
 @app.get("/mcp/get/{memory_id}")
 async def get_memory(memory_id: str) -> dict:
     with db_conn() as db:
@@ -851,6 +1616,8 @@ async def update_memory(memory_id: str, req: UpdateRequest) -> dict:
             params.append(req.content.strip())
             updates.append("checksum=?")
             params.append(compute_checksum(req.content))
+            updates.append("simhash=?")
+            params.append(compute_simhash(req.content))
         if req.type is not None:
             updates.append("type=?")
             params.append(req.type)
@@ -885,6 +1652,15 @@ async def update_memory(memory_id: str, req: UpdateRequest) -> dict:
             (memory_id, req.content or "", now_iso()),
         )
 
+        # 创建版本快照（如果内容被修改）
+        if req.content is not None:
+            VersionManager.create_version(
+                db, memory_id, req.content.strip(),
+                change_type="update",
+                changed_by="api",
+                change_reason="Content updated via API"
+            )
+
     return {"success": True, "action": "updated", "id": memory_id}
 
 
@@ -894,11 +1670,16 @@ async def delete_memory(memory_id: str) -> dict:
         existing = db.execute("SELECT id FROM memories WHERE id=?", (memory_id,)).fetchone()
         if not existing:
             raise HTTPException(status_code=404, detail=f"Memory {memory_id} not found")
+
+        # 清理关联表（session_memories 和 change_log 没有 ON DELETE CASCADE）
+        db.execute("DELETE FROM session_memories WHERE memory_id=?", (memory_id,))
+        db.execute("DELETE FROM change_log WHERE memory_id=?", (memory_id,))
+        db.execute("DELETE FROM raw_memories WHERE memory_id=?", (memory_id,))
+
+        # 删除记忆（memory_versions, evolution_log, memory_branches 有 CASCADE 会自动清理）
         db.execute("DELETE FROM memories WHERE id=?", (memory_id,))
-        db.execute(
-            "INSERT INTO change_log (memory_id, action, snapshot, timestamp) VALUES (?, 'delete', '', ?)",
-            (memory_id, now_iso()),
-        )
+
+        log.info(f"Memory {memory_id[:8]}... deleted with all related data")
     return {"success": True, "action": "deleted", "id": memory_id}
 
 
@@ -906,6 +1687,7 @@ async def delete_memory(memory_id: str) -> dict:
 
 
 def _get_stats(db: sqlite3.Connection) -> dict:
+    """Return statistics about stored memories: counts by active/archived status, source, type, and scope."""
     total = db.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
     active = db.execute("SELECT COUNT(*) FROM memories WHERE archived=0").fetchone()[0]
     archived = db.execute("SELECT COUNT(*) FROM memories WHERE archived=1").fetchone()[0]
@@ -932,10 +1714,7 @@ def _get_stats(db: sqlite3.Connection) -> dict:
     }
 
 
-@app.get("/mcp/stats")
-async def stats() -> dict:
-    with db_conn() as db:
-        return _get_stats(db)
+# ── Export ───────────────────────────────────────────────
 
 
 @app.get("/mcp/export")
@@ -1053,6 +1832,7 @@ async def get_sync_status() -> dict:
     with db_conn() as db:
         rows = db.execute("SELECT * FROM sync_status ORDER BY tool").fetchall()
         # Also check if any tool is stale (>30 min since last beat)
+        results = []
         for row in rows:
             row_dict = dict(row)
             try:
@@ -1066,7 +1846,8 @@ async def get_sync_status() -> dict:
                     row_dict["status"] = "healthy"
             except Exception:
                 row_dict["status"] = "unknown"
-    return {"success": True, "sync_status": [dict(r) for r in rows]}
+            results.append(row_dict)
+    return {"success": True, "sync_status": results}
 
 
 @app.post("/mcp/sync/heartbeat")
@@ -1254,6 +2035,120 @@ MCP_TOOLS = [
             },
             "required": ["tool"]
         }
+    },
+    {
+        "name": "mem_history",
+        "description": "获取记忆的版本历史（Git for Memory）。查看一条记忆的所有变更记录。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "memory_id": {"type": "string", "description": "记忆ID"},
+                "limit": {"type": "integer", "description": "返回版本数量", "default": 20}
+            },
+            "required": ["memory_id"]
+        }
+    },
+    {
+        "name": "mem_diff",
+        "description": "对比记忆的两个版本差异（Git for Memory）。查看具体改了什么。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "memory_id": {"type": "string", "description": "记忆ID"},
+                "version_a": {"type": "integer", "description": "旧版本号"},
+                "version_b": {"type": "integer", "description": "新版本号"}
+            },
+            "required": ["memory_id", "version_a", "version_b"]
+        }
+    },
+    {
+        "name": "mem_rollback",
+        "description": "回滚记忆到指定版本（Git for Memory）。进化出错时可恢复。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "memory_id": {"type": "string", "description": "记忆ID"},
+                "version": {"type": "integer", "description": "要回滚到的版本号"},
+                "agent": {"type": "string", "description": "执行回滚的Agent", "default": "system"}
+            },
+            "required": ["memory_id", "version"]
+        }
+    },
+    {
+        "name": "mem_branch",
+        "description": "创建或列出记忆分支（Git for Memory）。支持多Agent并行演化。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "memory_id": {"type": "string", "description": "记忆ID"},
+                "action": {"type": "string", "enum": ["create", "list"], "description": "操作类型"},
+                "branch_name": {"type": "string", "description": "分支名称（create时必填）"},
+                "from_version": {"type": "integer", "description": "从哪个版本创建分支（默认最新）"}
+            },
+            "required": ["memory_id", "action"]
+        }
+    },
+    {
+        "name": "mem_merge",
+        "description": "合并记忆分支（Git for Memory）。将源分支合并到目标分支。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "memory_id": {"type": "string", "description": "记忆ID"},
+                "source_branch": {"type": "string", "description": "源分支名称"},
+                "target_branch": {"type": "string", "description": "目标分支名称"},
+                "agent": {"type": "string", "description": "执行合并的Agent", "default": "system"}
+            },
+            "required": ["memory_id", "source_branch", "target_branch"]
+        }
+    },
+    {
+        "name": "mem_offload",
+        "description": "上下文卸载。将长文本卸载到原始层(L0)，返回索引ID，后续可通过 mem_drilldown 钻回。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "content": {"type": "string", "description": "要卸载的长文本内容"},
+                "session_id": {"type": "string", "description": "会话ID（可选）"},
+                "source": {"type": "string", "description": "来源", "default": "unknown"}
+            },
+            "required": ["content"]
+        }
+    },
+    {
+        "name": "mem_drilldown",
+        "description": "钻回查询。通过 raw memory ID 获取原始卸载内容。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "memory_id": {"type": "string", "description": "raw memory ID（由 mem_offload 返回）"}
+            },
+            "required": ["memory_id"]
+        }
+    },
+    {
+        "name": "mem_scenario",
+        "description": "获取场景聚合（L2层）。按分类查询多条记忆聚合的场景。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "category_id": {"type": "string", "description": "分类ID"},
+                "days": {"type": "integer", "description": "时间窗口天数", "default": 7}
+            },
+            "required": ["category_id"]
+        }
+    },
+    {
+        "name": "mem_persona",
+        "description": "获取画像（L3层）。查询用户/项目/领域画像。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "persona_type": {"type": "string", "enum": ["user", "project", "domain"], "description": "画像类型"},
+                "name": {"type": "string", "description": "画像名称"}
+            },
+            "required": ["persona_type", "name"]
+        }
     }
 ]
 
@@ -1335,6 +2230,87 @@ async def handle_mcp_tools_call(request_id: Any, params: dict) -> dict:
                 count=arguments.get("count", 0),
             )
             result = await sync_heartbeat(hb_req)
+            text = json.dumps(result, ensure_ascii=False)
+
+        elif tool_name == "mem_history":
+            memory_id = arguments.get("memory_id", "")
+            limit = arguments.get("limit", 20)
+            with db_conn() as db:
+                history = VersionManager.get_history(db, memory_id, limit)
+            text = json.dumps({"memory_id": memory_id, "versions": history}, ensure_ascii=False, default=str)
+
+        elif tool_name == "mem_diff":
+            memory_id = arguments.get("memory_id", "")
+            version_a = arguments.get("version_a")
+            version_b = arguments.get("version_b")
+            with db_conn() as db:
+                diff_result = VersionManager.get_diff(db, memory_id, version_a, version_b)
+            text = json.dumps(diff_result, ensure_ascii=False, default=str)
+
+        elif tool_name == "mem_rollback":
+            memory_id = arguments.get("memory_id", "")
+            version = arguments.get("version")
+            agent = arguments.get("agent", "system")
+            with db_conn() as db:
+                rollback_result = VersionManager.rollback(db, memory_id, version, agent)
+            text = json.dumps(rollback_result, ensure_ascii=False, default=str)
+
+        elif tool_name == "mem_branch":
+            memory_id = arguments.get("memory_id", "")
+            action = arguments.get("action", "list")
+            if action == "create":
+                branch_name = arguments.get("branch_name", "")
+                from_version = arguments.get("from_version")
+                if not branch_name:
+                    text = json.dumps({"error": "branch_name required for create"}, ensure_ascii=False)
+                else:
+                    with db_conn() as db:
+                        result = VersionManager.create_branch(
+                            db, memory_id, branch_name, from_version,
+                            source=arguments.get("source", "system")
+                        )
+                    text = json.dumps(result, ensure_ascii=False, default=str)
+            else:  # list
+                with db_conn() as db:
+                    branches = VersionManager.list_branches(db, memory_id)
+                text = json.dumps({"memory_id": memory_id, "branches": branches}, ensure_ascii=False, default=str)
+
+        elif tool_name == "mem_merge":
+            memory_id = arguments.get("memory_id", "")
+            source_branch = arguments.get("source_branch", "")
+            target_branch = arguments.get("target_branch", "")
+            agent = arguments.get("agent", "system")
+            with db_conn() as db:
+                merge_result = VersionManager.merge_branch(
+                    db, memory_id, source_branch, target_branch, agent
+                )
+            text = json.dumps(merge_result, ensure_ascii=False, default=str)
+
+        elif tool_name == "mem_offload":
+            req = OffloadRequest(
+                content=arguments.get("content", ""),
+                session_id=arguments.get("session_id"),
+                source=arguments.get("source", "unknown"),
+            )
+            result = await offload_memory(req)
+            text = json.dumps(result, ensure_ascii=False)
+
+        elif tool_name == "mem_drilldown":
+            result = await drilldown_memory(arguments.get("memory_id", ""))
+            text = json.dumps(result, ensure_ascii=False)
+
+        elif tool_name == "mem_scenario":
+            result = await get_scenario(
+                category_id=arguments.get("category_id", "general"),
+                days=arguments.get("days", 7),
+            )
+            text = json.dumps(result, ensure_ascii=False)
+
+        elif tool_name == "mem_persona":
+            result = await get_persona(
+                persona_type=arguments.get("persona_type", "user"),
+                name=arguments.get("name", ""),
+            )
             text = json.dumps(result, ensure_ascii=False)
 
         else:
@@ -1442,6 +2418,7 @@ async def batch_save(req: BatchSaveRequest) -> dict:
             memory_id = mem.id or str(uuid.uuid4())
             now = now_iso()
             checksum = compute_checksum(mem.content)
+            simhash_val = compute_simhash(mem.content)
             mem_type = mem.type or detect_type(mem.content)
             tags_json = json.dumps(mem.tags or [])
             category_id = mem.category_id or "general"
@@ -1454,13 +2431,18 @@ async def batch_save(req: BatchSaveRequest) -> dict:
                 skipped += 1
                 continue
 
+            # Fuzzy dedup: check simhash
+            near_dup = _find_near_duplicate(db, simhash_val)
+            if near_dup:
+                skipped += 1
+                continue
             db.execute(
                 """INSERT INTO memories
                    (id, content, type, scope, source, priority, confidence, tags, category_id,
-                    created_at, updated_at, recall_count, archived, checksum)
-                   VALUES (?, ?, ?, ?, ?, ?, 0.8, ?, ?, ?, ?, 0, 0, ?)""",
+                    created_at, updated_at, recall_count, archived, checksum, simhash)
+                   VALUES (?, ?, ?, ?, ?, ?, 0.8, ?, ?, ?, ?, 0, 0, ?, ?)""",
                 (memory_id, mem.content.strip(), mem_type, mem.scope,
-                 mem.source, mem.priority or "P1", tags_json, category_id, now, now, checksum),
+                 mem.source, mem.priority or "P1", tags_json, category_id, now, now, checksum, simhash_val),
             )
 
             if mem.session_id:
@@ -1473,6 +2455,16 @@ async def batch_save(req: BatchSaveRequest) -> dict:
                 "INSERT INTO change_log (memory_id, action, snapshot, timestamp) VALUES (?, 'save', ?, ?)",
                 (memory_id, mem.content.strip(), now),
             )
+
+            # 创建初始版本快照
+            VersionManager.create_version(
+                db, memory_id, mem.content.strip(),
+                change_type="create",
+                changed_by=mem.source or "system",
+                change_reason="Batch save",
+                metadata={"type": mem_type, "category": category_id, "priority": mem.priority or "P1"}
+            )
+
             saved += 1
             ids.append(memory_id)
     return {"success": True, "saved": saved, "skipped": skipped, "ids": ids}
@@ -1707,6 +2699,234 @@ async def set_apikey(req: SetKeyRequest) -> dict:
     masked = new_key[:16] + "..." + new_key[-4:] if len(new_key) > 24 else "****"
     log.warning("API Key manually set — saved to %s", KEY_FILE)
     return {"success": True, "masked": masked, "message": "Custom key set."}
+
+
+# ── Dashboard ────────────────────────────────────────────
+
+STATIC_DIR = Path(__file__).parent / "static"
+if STATIC_DIR.exists():
+    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard_page():
+    dashboard_file = STATIC_DIR / "dashboard.html"
+    if not dashboard_file.exists():
+        return HTMLResponse("<h1>Dashboard not found</h1>", status_code=404)
+    return HTMLResponse(dashboard_file.read_text(encoding="utf-8"))
+
+
+@app.get("/api/dashboard/overview")
+async def dashboard_overview():
+    """Return overview data: metrics + category/source distribution + timeline."""
+    with db_conn() as db:
+        total = db.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
+        active = db.execute("SELECT COUNT(*) FROM memories WHERE archived=0").fetchone()[0]
+        archived = db.execute("SELECT COUNT(*) FROM memories WHERE archived=1").fetchone()[0]
+
+        # Today new
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        today_new = db.execute(
+            "SELECT COUNT(*) FROM memories WHERE created_at LIKE ?", (today + "%",)
+        ).fetchone()[0]
+
+        # Active agents (from sync_status with heartbeat within the last 5 mins)
+        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S")
+        active_agents = db.execute(
+            "SELECT COUNT(*) FROM sync_status WHERE last_beat >= ?", (cutoff,)
+        ).fetchone()[0]
+
+        # Total versions
+        total_versions = db.execute("SELECT COUNT(*) FROM memory_versions").fetchone()[0]
+
+        # By category
+        by_category = {}
+        for row in db.execute(
+            "SELECT COALESCE(c.name, m.category_id) as name, COUNT(m.id) as cnt "
+            "FROM memories m LEFT JOIN categories c ON m.category_id = c.id "
+            "WHERE m.archived=0 GROUP BY COALESCE(c.name, m.category_id) ORDER BY cnt DESC"
+        ):
+            by_category[row["name"]] = row["cnt"]
+
+        # By source
+        by_source = {}
+        for row in db.execute(
+            "SELECT source, COUNT(*) as c FROM memories WHERE archived=0 GROUP BY source ORDER BY c DESC"
+        ):
+            by_source[row["source"] or "unknown"] = row["c"]
+
+        # Timeline (last 30 days)
+        timeline = _build_timeline(db, 30)
+
+    return {
+        "total": total,
+        "active": active,
+        "archived": archived,
+        "today_new": today_new,
+        "active_agents": active_agents,
+        "total_versions": total_versions,
+        "by_category": by_category,
+        "by_source": by_source,
+        "timeline": timeline,
+    }
+
+
+@app.get("/api/dashboard/categories")
+async def dashboard_categories():
+    """Return category list for filters."""
+    with db_conn() as db:
+        rows = db.execute(
+            "SELECT id, name, icon FROM categories ORDER BY sort_order"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+@app.get("/api/dashboard/memories")
+async def dashboard_memories(
+    page: int = 1,
+    page_size: int = 20,
+    q: Optional[str] = None,
+    category: Optional[str] = None,
+    source: Optional[str] = None,
+    priority: Optional[str] = None,
+):
+    # 限制 page_size 上界，防止全表扫描
+    page_size = min(max(page_size, 1), 200)
+    page = max(page, 1)
+    """Return paginated memory list with optional filters."""
+    offset = (max(1, page) - 1) * page_size
+    conditions = ["archived=0"]
+    params: list[Any] = []
+
+    if q:
+        conditions.append("content LIKE ?")
+        params.append(f"%{q}%")
+    if category:
+        conditions.append("category_id=?")
+        params.append(category)
+    if source:
+        conditions.append("source=?")
+        params.append(source)
+    if priority:
+        conditions.append("priority=?")
+        params.append(priority)
+
+    where = " AND ".join(conditions)
+
+    with db_conn() as db:
+        total = db.execute(f"SELECT COUNT(*) FROM memories WHERE {where}", params).fetchone()[0]
+        rows = db.execute(
+            f"SELECT id, content, category_id, type, source, priority, scope, tags, "
+            f"created_at, updated_at FROM memories WHERE {where} "
+            f"ORDER BY updated_at DESC LIMIT ? OFFSET ?",
+            params + [page_size, offset],
+        ).fetchall()
+
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    return {
+        "items": [dict(r) for r in rows],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": total_pages,
+    }
+
+
+@app.get("/api/dashboard/memories/{memory_id}")
+async def dashboard_memory_detail(memory_id: str):
+    """Return memory detail + version history."""
+    with db_conn() as db:
+        row = db.execute(
+            "SELECT id, content, category_id, type, source, priority, scope, tags, "
+            "simhash, checksum, created_at, updated_at "
+            "FROM memories WHERE id=?", (memory_id,)
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Memory not found")
+
+        versions = db.execute(
+            "SELECT id, version, change_type, changed_by, change_reason, "
+            "diff_from_prev, created_at FROM memory_versions "
+            "WHERE memory_id=? ORDER BY version DESC", (memory_id,)
+        ).fetchall()
+
+    mem_dict = dict(row)
+    return {
+        **mem_dict,
+        "versions": [dict(v) for v in versions],
+    }
+
+
+@app.get("/api/dashboard/timeline")
+async def dashboard_timeline(days: int = 30):
+    """Return daily creation counts for the last N days."""
+    with db_conn() as db:
+        timeline = _build_timeline(db, days)
+    return {"timeline": timeline, "days_total": days}
+
+
+@app.get("/api/dashboard/evolution/{memory_id}")
+async def dashboard_evolution(memory_id: str):
+    """Return evolution history for a specific memory."""
+    with db_conn() as db:
+        versions = db.execute(
+            "SELECT id, version, content, content_hash, diff_from_prev, "
+            "change_type, changed_by, change_reason, metadata_snapshot, created_at "
+            "FROM memory_versions WHERE memory_id=? ORDER BY version ASC",
+            (memory_id,),
+        ).fetchall()
+
+        evolutions = db.execute(
+            "SELECT id, event_type, from_version, to_version, agent, details, created_at "
+            "FROM evolution_log WHERE memory_id=? ORDER BY created_at ASC",
+            (memory_id,),
+        ).fetchall()
+
+    return {
+        "memory_id": memory_id,
+        "versions": [dict(v) for v in versions],
+        "evolutions": [dict(e) for e in evolutions],
+    }
+
+
+@app.get("/api/dashboard/health")
+async def dashboard_health():
+    """Return system health: DB stats, sync status, version stats."""
+
+    with db_conn() as db:
+        total = db.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
+        active = db.execute("SELECT COUNT(*) FROM memories WHERE archived=0").fetchone()[0]
+        archived = db.execute("SELECT COUNT(*) FROM memories WHERE archived=1").fetchone()[0]
+
+        db_size = 0
+        try:
+            db_size = round(os.path.getsize(str(DB_PATH)) / (1024 * 1024), 2)
+        except Exception:
+            pass
+
+        sync_rows = db.execute("SELECT * FROM sync_status ORDER BY tool").fetchall()
+
+        total_versions = db.execute("SELECT COUNT(*) FROM memory_versions").fetchone()[0]
+        total_evolutions = db.execute("SELECT COUNT(*) FROM evolution_log").fetchone()[0]
+        total_relations = db.execute("SELECT COUNT(*) FROM memory_relations").fetchone()[0]
+        total_change_log = db.execute("SELECT COUNT(*) FROM change_log").fetchone()[0]
+
+    return {
+        "db_stats": {
+            "path": str(DB_PATH),
+            "size_mb": db_size,
+            "total_records": total,
+            "active": active,
+            "archived": archived,
+        },
+        "sync": [dict(r) for r in sync_rows],
+        "version_stats": {
+            "total_versions": total_versions,
+            "total_evolutions": total_evolutions,
+            "total_relations": total_relations,
+            "total_change_log": total_change_log,
+        },
+    }
 
 
 # ── Run ──────────────────────────────────────────────────
