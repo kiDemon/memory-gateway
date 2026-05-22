@@ -68,6 +68,18 @@ def init_db(db: sqlite3.Connection) -> None:
             db.commit()
             log.info(f"Backfilled simhash for {len(rows)} memories")
 
+    # Schema migration: add hot_tier, ttl_days, vector_clock for v5 features
+    if columns:
+        for col_name, col_default in [
+            ("hot_tier", "0"),
+            ("ttl_days", "0"),
+            ("vector_clock", "'{}'"),
+        ]:
+            if col_name not in columns:
+                log.info(f"Migrating: adding {col_name} column to memories")
+                db.execute(f"ALTER TABLE memories ADD COLUMN {col_name} TEXT DEFAULT '{col_default}'")
+                db.commit()
+
     # Schema migration: rebuild FTS5 if old schema (no category_id)
     try:
         fts_info = db.execute("SELECT sql FROM sqlite_master WHERE name='memories_fts'").fetchone()
@@ -116,7 +128,7 @@ def init_db(db: sqlite3.Connection) -> None:
     ('work_energy', '能源', 'work', '⚡', 7),
     ('work_regional', '区域', 'work', '🌍', 8);
 
-    -- 记忆表
+    -- 记忆表 (v5: +hot_tier, ttl_days, vector_clock)
     CREATE TABLE IF NOT EXISTS memories (
         id          TEXT PRIMARY KEY,
         content     TEXT NOT NULL,
@@ -128,6 +140,9 @@ def init_db(db: sqlite3.Connection) -> None:
         tags        TEXT DEFAULT '[]',
         category_id TEXT DEFAULT 'general',
         embedding   BLOB,
+        hot_tier    INTEGER NOT NULL DEFAULT 0,
+        ttl_days    INTEGER NOT NULL DEFAULT 0,
+        vector_clock TEXT DEFAULT '{}',
         created_at  TEXT NOT NULL,
         updated_at  TEXT NOT NULL,
         last_recalled TEXT,
@@ -270,6 +285,21 @@ def init_db(db: sqlite3.Connection) -> None:
 
     CREATE INDEX IF NOT EXISTS idx_branches_memory ON memory_branches(memory_id);
     CREATE INDEX IF NOT EXISTS idx_branches_name ON memory_branches(memory_id, branch_name);
+
+    -- ═══ 检索审计日志 ═══
+    CREATE TABLE IF NOT EXISTS search_audit_log (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        query           TEXT NOT NULL,
+        source          TEXT NOT NULL DEFAULT 'unknown',
+        result_count    INTEGER NOT NULL DEFAULT 0,
+        result_ids      TEXT DEFAULT '[]',
+        latency_ms      REAL DEFAULT 0,
+        search_type     TEXT NOT NULL DEFAULT 'fts5',
+        hit_cache       INTEGER NOT NULL DEFAULT 0,
+        created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_audit_query ON search_audit_log(created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_audit_source ON search_audit_log(source, created_at DESC);
 
     -- ═══ 上下文卸载 & 4层渐进存储 ═══
 
@@ -510,6 +540,297 @@ def _build_timeline(db: sqlite3.Connection, days: int = 30) -> list[dict]:
     return timeline
 
 
+# ══════════════════════════════════════════════════════════
+# V5 Optimizations: HotCache, Embedding, Decay, Audit, VClock
+# ══════════════════════════════════════════════════════════
+
+# ── Hot Cache (LRU in-memory) ────────────────────────────
+
+from collections import OrderedDict
+import threading
+import struct
+import math
+
+HOT_CACHE_MAX = int(os.environ.get("MEMORY_HOT_CACHE_SIZE", "200"))
+HOT_CACHE_TTL = int(os.environ.get("MEMORY_HOT_CACHE_TTL", "300"))  # seconds
+
+
+from typing import Any as _Any
+
+class HotCache:
+    """Thread-safe LRU cache for frequently accessed memories.
+
+    Auto-promotes P0 + high-recall-count memories to hot tier in DB.
+    """
+
+    def __init__(self, max_size: int = HOT_CACHE_MAX, ttl: int = HOT_CACHE_TTL):
+        self._cache: OrderedDict[str, tuple[_Any, float]] = OrderedDict()
+        self._max = max_size
+        self._ttl = ttl
+        self._lock = threading.Lock()
+
+    def get(self, key: str) -> _Any | None:
+        with self._lock:
+            if key not in self._cache:
+                return None
+            entry, ts = self._cache[key]
+            if time.time() - ts > self._ttl:
+                del self._cache[key]
+                return None
+            self._cache.move_to_end(key)
+            return entry
+
+    def put(self, key: str, value: _Any) -> None:
+        with self._lock:
+            if key in self._cache:
+                self._cache.move_to_end(key)
+            self._cache[key] = (value, time.time())
+            while len(self._cache) > self._max:
+                self._cache.popitem(last=False)
+
+    def invalidate(self, key: str) -> None:
+        with self._lock:
+            self._cache.pop(key, None)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._cache.clear()
+
+    @property
+    def size(self) -> int:
+        with self._lock:
+            return len(self._cache)
+
+
+hot_cache = HotCache()
+
+
+def _promote_to_hot(db: sqlite3.Connection, memory_id: str) -> None:
+    """Promote a memory to hot tier (hot_tier=1)."""
+    db.execute("UPDATE memories SET hot_tier=1 WHERE id=?", (memory_id,))
+
+
+def _sync_hot_tier_from_cache(db: sqlite3.Connection) -> None:
+    """Periodically sync hot tier status: P0 + frequently recalled → hot_tier=1."""
+    db.execute("""
+        UPDATE memories SET hot_tier=1
+        WHERE archived=0 AND (priority='P0' OR recall_count >= 3)
+        AND hot_tier=0
+    """)
+    # Demote inactive hot items
+    db.execute("""
+        UPDATE memories SET hot_tier=0
+        WHERE hot_tier=1 AND recall_count=0
+        AND last_recalled IS NULL
+        AND priority != 'P0'
+    """)
+
+
+# ── Embedding (optional, sentence-transformers) ──────────
+
+_embed_model = None
+EMBEDDING_DIM = int(os.environ.get("MEMORY_EMBEDDING_DIM", "384"))
+
+
+def _get_embed_model():
+    """Lazy-load the embedding model (all-MiniLM-L6-v2, 384-dim, ~80MB)."""
+    global _embed_model
+    if _embed_model is not None:
+        return _embed_model
+    try:
+        from sentence_transformers import SentenceTransformer
+        model_name = os.environ.get("MEMORY_EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+        _embed_model = SentenceTransformer(model_name)
+        log.info(f"Embedding model loaded: {model_name} (dim={_embed_model.get_sentence_embedding_dimension()})")
+        return _embed_model
+    except ImportError:
+        log.warning("sentence-transformers not installed — embedding search disabled")
+        return None
+    except Exception as e:
+        log.warning(f"Failed to load embedding model: {e}")
+        return None
+
+
+def _blob_to_vector(blob: bytes) -> list[float] | None:
+    """Decode BLOB to float list."""
+    if not blob:
+        return None
+    try:
+        n = len(blob) // 4
+        return list(struct.unpack(f'{n}f', blob))
+    except struct.error:
+        return None
+
+
+def _vector_to_blob(vec: list[float]) -> bytes:
+    """Encode float list to BLOB."""
+    return struct.pack(f'{len(vec)}f', *vec)
+
+
+def _cosine_similarity(a: list[float], b: list[float]) -> float:
+    """Compute cosine similarity between two vectors."""
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = math.sqrt(sum(x * x for x in a))
+    norm_b = math.sqrt(sum(x * x for x in b))
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
+def _compute_embedding(content: str) -> bytes | None:
+    """Compute embedding for content. Returns BLOB or None if model unavailable."""
+    model = _get_embed_model()
+    if model is None:
+        return None
+    vec = model.encode(content, normalize_embeddings=True).tolist()
+    return _vector_to_blob(vec)
+
+
+def _hybrid_search(db: sqlite3.Connection, query: str, query_embedding: bytes | None,
+                   fts_results: list[sqlite3.Row], limit: int,
+                   semantic_weight: float = 0.4) -> list[dict]:
+    """Merge FTS5 results with semantic similarity scores.
+
+    If query_embedding is None (no embedding model), returns FTS results as-is.
+    semantic_weight: 0.0 = pure FTS, 1.0 = pure semantic
+    """
+    if query_embedding is None or not fts_results:
+        return [row_to_dict(r) for r in fts_results]
+
+    query_vec = _blob_to_vector(query_embedding)
+    if query_vec is None:
+        return [row_to_dict(r) for r in fts_results]
+
+    scored = []
+    max_fts_rank = max((abs(r["rank"]) for r in fts_results if r["rank"]), default=1.0)
+
+    for r in fts_results:
+        d = row_to_dict(r)
+        # FTS score (normalized, inverted: lower rank = better)
+        fts_score = 1.0 - (abs(r["rank"]) / max_fts_rank) if max_fts_rank > 0 else 0.5
+
+        # Semantic score from stored embedding
+        mem_vec = _blob_to_vector(r["embedding"]) if "embedding" in r.keys() else None
+        if mem_vec:
+            sem_score = _cosine_similarity(query_vec, mem_vec)
+        else:
+            sem_score = 0.0
+
+        # Hybrid score
+        hybrid_score = (1 - semantic_weight) * fts_score + semantic_weight * sem_score
+        d["_fts_score"] = round(fts_score, 3)
+        d["_sem_score"] = round(sem_score, 3)
+        d["_hybrid_score"] = round(hybrid_score, 3)
+        scored.append((hybrid_score, d))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [d for _, d in scored[:limit]]
+
+
+# ── Memory Decay & Auto-Cleanup ──────────────────────────
+
+# Default TTLs per priority
+DEFAULT_TTL = {
+    "P0": 0,     # never expire
+    "P1": 180,   # 6 months
+    "P2": 60,    # 2 months
+}
+
+# Minimum recall count to resist decay
+DECAY_THRESHOLD = 2
+
+
+def _apply_decay(db: sqlite3.Connection) -> dict:
+    """Apply memory decay: archive expired P2 memories, decay unused ones.
+
+    Returns stats about what was done.
+    """
+    now = now_iso()
+    stats = {"archived": 0, "decayed": 0, "errors": 0}
+
+    # 1. Archive memories past their TTL
+    for priority, ttl_days in DEFAULT_TTL.items():
+        if ttl_days <= 0:
+            continue
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=ttl_days)).isoformat()
+        result = db.execute(
+            """UPDATE memories SET archived=1, updated_at=?
+               WHERE priority=? AND created_at < ? AND archived=0 AND recall_count < ?""",
+            (now, priority, cutoff, DECAY_THRESHOLD),
+        )
+        stats["archived"] += result.rowcount
+
+    # 2. Demote hot_tier for memories not recalled recently
+    three_months_ago = (datetime.now(timezone.utc) - timedelta(days=90)).isoformat()
+    result = db.execute(
+        """UPDATE memories SET hot_tier=0
+           WHERE hot_tier=1 AND priority!='P0'
+           AND (last_recalled IS NULL OR last_recalled < ?)""",
+        (three_months_ago,),
+    )
+    stats["decayed"] = result.rowcount
+
+    if stats["archived"] > 0:
+        log.info(f"Decay: archived {stats['archived']} expired memories")
+    if stats["decayed"] > 0:
+        log.info(f"Decay: demoted {stats['decayed']} cold memories from hot tier")
+
+    return stats
+
+
+# ── Vector Clock Conflict Detection ──────────────────────
+
+
+def _update_vector_clock(db: sqlite3.Connection, memory_id: str,
+                         source: str) -> dict:
+    """Update vector clock for a tool and check for conflicts.
+
+    Returns: {"conflict": bool, "clock": dict, "detail": str}
+    """
+    row = db.execute(
+        "SELECT vector_clock, source FROM memories WHERE id=?", (memory_id,)
+    ).fetchone()
+    if not row:
+        return {"conflict": False, "clock": {}, "detail": "Memory not found"}
+
+    try:
+        clock = json.loads(row["vector_clock"] or "{}")
+    except json.JSONDecodeError:
+        clock = {}
+
+    now = now_iso()
+    other_sources = {k: v for k, v in clock.items() if k != source}
+
+    # Conflict: another tool modified this memory AFTER our last known timestamp
+    conflict = False
+    conflict_detail = ""
+    our_timestamp = clock.get(source)
+
+    if our_timestamp:
+        for tool, ts in other_sources.items():
+            if ts > our_timestamp:
+                conflict = True
+                conflict_detail += f"{tool} modified at {ts} (after your {our_timestamp}); "
+
+    # Update our timestamp
+    clock[source] = now
+    db.execute(
+        "UPDATE memories SET vector_clock=?, updated_at=? WHERE id=?",
+        (json.dumps(clock), now, memory_id),
+    )
+
+    return {
+        "conflict": conflict,
+        "clock": clock,
+        "detail": conflict_detail.strip() if conflict else "no conflict",
+    }
+
+
+# ══════════════════════════════════════════════════════════
+
+
 def detect_type(content: str) -> str:
     lower = content.lower()
     scores = {}
@@ -530,7 +851,13 @@ def row_to_dict(row: sqlite3.Row) -> dict:
             d["tags"] = json.loads(d["tags"])
         except (json.JSONDecodeError, TypeError):
             d["tags"] = []
-    d.pop("embedding", None)
+    # Parse vector_clock if present
+    if "vector_clock" in d and isinstance(d["vector_clock"], str):
+        try:
+            d["vector_clock"] = json.loads(d["vector_clock"])
+        except (json.JSONDecodeError, TypeError):
+            d["vector_clock"] = {}
+    d.pop("embedding", None)  # keep hidden (binary BLOB)
     return d
 
 
@@ -1242,7 +1569,7 @@ async def startup() -> None:
 async def health() -> dict:
     with db_conn() as db:
         count = db.execute("SELECT COUNT(*) FROM memories WHERE archived=0").fetchone()[0]
-    return {"status": "ok", "version": "4.0.0", "memories": count, "db": str(DB_PATH)}
+    return {"status": "ok", "version": "5.0.0", "memories": count, "db": str(DB_PATH)}
 
 
 @app.get("/")
@@ -1289,13 +1616,24 @@ async def save_memory(req: SaveRequest) -> dict:
                 "similarity": near_dup["similarity"],
             }
 
+        # Compute embedding (non-blocking, optional)
+        embedding_blob = _compute_embedding(req.content.strip())
+        # Initialize vector clock
+        init_clock = json.dumps({req.source: now})
+
         db.execute(
            """INSERT INTO memories
               (id, content, type, scope, source, priority, confidence, tags, category_id,
+                embedding, hot_tier, ttl_days, vector_clock,
                 created_at, updated_at, recall_count, archived, checksum, simhash)
-              VALUES (?, ?, ?, ?, ?, ?, 0.8, ?, ?, ?, ?, 0, 0, ?, ?)""",
+              VALUES (?, ?, ?, ?, ?, ?, 0.8, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?)""",
            (memory_id, req.content.strip(), mem_type, req.scope,
-            req.source, req.priority or "P1", tags_json, category_id, now, now, checksum, simhash),
+            req.source, req.priority or "P1", tags_json, category_id,
+            embedding_blob,
+            1 if (req.priority or "P1") == "P0" else 0,  # P0 → hot immediately
+            DEFAULT_TTL.get(req.priority or "P1", 0),
+            init_clock,
+            now, now, checksum, simhash),
         )
 
         # 创建初始版本快照
@@ -1412,7 +1750,20 @@ async def get_persona(persona_type: str, name: str) -> dict:
 
 @app.post("/mcp/search")
 async def search_memory(req: SearchRequest) -> dict:
+    t_start = time.time()
     with db_conn() as db:
+        # ── Hot cache check ──
+        cache_key = f"search:{req.q}:{req.category_filter}:{req.type_filter}:{req.source_filter}"
+        cached = hot_cache.get(cache_key)
+        if cached:
+            return {
+                "success": True,
+                "count": len(cached),
+                "results": cached,
+                "from_cache": True,
+                "cache_size": hot_cache.size,
+            }
+
         safe_q = req.q.replace('"', '""')
 
         conditions = ["m.archived=0"]
@@ -1424,7 +1775,6 @@ async def search_memory(req: SearchRequest) -> dict:
             conditions[0] = "1=1"
 
         if req.category_filter:
-            # 支持父分类过滤：category=work 也会匹配 work_comprehensive, work_hr 等
             if req.category_filter == "work":
                 conditions.append("(m.category_id = ? OR m.category_id LIKE ?)")
                 params.append(req.category_filter)
@@ -1444,7 +1794,7 @@ async def search_memory(req: SearchRequest) -> dict:
 
         where = " AND ".join(conditions)
 
-        # Short queries (< 3 chars) use LIKE directly — trigram needs >= 3 chars
+        # Short queries (< 3 chars) use LIKE directly
         if len(req.q) < 3:
             like_q = f"%{req.q}%"
             sql = f"""
@@ -1455,6 +1805,7 @@ async def search_memory(req: SearchRequest) -> dict:
                 LIMIT ?
             """
             rows = db.execute(sql, [like_q] + params + [req.limit]).fetchall()
+            search_type = "like"
         else:
             fts_query = f'"{safe_q}"'
             sql = f"""
@@ -1469,8 +1820,8 @@ async def search_memory(req: SearchRequest) -> dict:
 
             try:
                 rows = db.execute(sql, fts_params).fetchall()
+                search_type = "fts5"
             except sqlite3.OperationalError:
-                # FTS query syntax error, fallback to LIKE
                 like_q = f"%{req.q}%"
                 sql_fallback = f"""
                     SELECT m.*, 0 as rank
@@ -1481,19 +1832,46 @@ async def search_memory(req: SearchRequest) -> dict:
                 """
                 params_fallback = [like_q] + params + [req.limit]
                 rows = db.execute(sql_fallback, params_fallback).fetchall()
+                search_type = "like_fallback"
+
+        # ── Hybrid rerank (semantic) ──
+        query_embedding = _compute_embedding(req.q) if len(req.q) >= 3 else None
+        results = _hybrid_search(db, req.q, query_embedding, list(rows),
+                                 req.limit, semantic_weight=0.35)
 
         # Update recall stats (batch)
         now = now_iso()
-        ids = [r["id"] for r in rows]
+        ids = [r["id"] for r in results]
         if ids:
             placeholders = ",".join("?" for _ in ids)
             db.execute(
                 f"UPDATE memories SET last_recalled=?, recall_count=recall_count+1 WHERE id IN ({placeholders})",
                 [now] + ids,
             )
+            # Promote to hot tier
+            _sync_hot_tier_from_cache(db)
 
-    results = [row_to_dict(r) for r in rows]
-    return {"success": True, "count": len(results), "results": results}
+        # ── Audit log ──
+        latency_ms = round((time.time() - t_start) * 1000, 2)
+        db.execute(
+            """INSERT INTO search_audit_log
+               (query, source, result_count, result_ids, latency_ms, search_type, hit_cache)
+               VALUES (?, ?, ?, ?, ?, ?, 0)""",
+            (req.q, req.source_filter or "unknown", len(results),
+             json.dumps(ids[:20]), latency_ms, search_type),
+        )
+
+        # ── Update hot cache ──
+        hot_cache.put(cache_key, results)
+
+    return {
+        "success": True,
+        "count": len(results),
+        "results": results,
+        "latency_ms": latency_ms,
+        "search_type": search_type,
+        "has_embedding": query_embedding is not None,
+    }
 
 
 @app.post("/mcp/list")
@@ -1592,6 +1970,149 @@ async def check_duplicates(req: CheckDuplicatesRequest) -> dict:
         "near": near_dupes,
     }
 
+
+# ══════════════════════════════════════════════════════════
+# V5 Endpoints: Hybrid Search, Audit, Cleanup, Cache Stats
+# ══════════════════════════════════════════════════════════
+
+
+class SearchHybridRequest(BaseModel):
+    q: str
+    category_filter: Optional[str] = None
+    scope_filter: Optional[str] = None
+    source_filter: Optional[str] = None
+    type_filter: Optional[str] = None
+    limit: int = Field(default=10, ge=1, le=100)
+    include_archived: bool = False
+    semantic_weight: float = Field(default=0.4, ge=0.0, le=1.0,
+                                   description="0.0=pure FTS, 1.0=pure semantic")
+
+
+@app.post("/mcp/search_hybrid")
+async def search_hybrid(req: SearchHybridRequest) -> dict:
+    """Hybrid search: combines FTS5 keyword + embedding semantic similarity."""
+    t_start = time.time()
+    with db_conn() as db:
+        conditions = ["m.archived=0"]
+        params: list[Any] = []
+
+        if not req.include_archived:
+            pass
+        else:
+            conditions[0] = "1=1"
+
+        if req.category_filter:
+            if req.category_filter == "work":
+                conditions.append("(m.category_id = ? OR m.category_id LIKE ?)")
+                params.append(req.category_filter)
+                params.append("work_%")
+            else:
+                conditions.append("m.category_id=?")
+                params.append(req.category_filter)
+        if req.scope_filter:
+            conditions.append("m.scope=?")
+            params.append(req.scope_filter)
+        if req.source_filter:
+            conditions.append("m.source=?")
+            params.append(req.source_filter)
+        if req.type_filter:
+            conditions.append("m.type=?")
+            params.append(req.type_filter)
+
+        where = " AND ".join(conditions)
+        safe_q = req.q.replace('"', '""')
+        fts_query = f'"{safe_q}"'
+
+        sql = f"""
+            SELECT m.*, fts.rank
+            FROM memories_fts fts
+            JOIN memories m ON m.rowid = fts.rowid
+            WHERE memories_fts MATCH ? AND {where}
+            ORDER BY fts.rank
+            LIMIT ?
+        """
+        rows = db.execute(sql, [fts_query] + params + [req.limit]).fetchall()
+
+        query_embedding = _compute_embedding(req.q) if len(req.q) >= 3 else None
+        results = _hybrid_search(db, req.q, query_embedding, list(rows),
+                                 req.limit, semantic_weight=req.semantic_weight)
+
+        latency_ms = round((time.time() - t_start) * 1000, 2)
+        ids = [r["id"] for r in results]
+
+        # Audit log
+        db.execute(
+            """INSERT INTO search_audit_log
+               (query, source, result_count, result_ids, latency_ms, search_type, hit_cache)
+               VALUES (?, ?, ?, ?, ?, 'hybrid', 0)""",
+            (req.q, req.source_filter or "unknown", len(results),
+             json.dumps(ids[:20]), latency_ms),
+        )
+
+    return {
+        "success": True,
+        "count": len(results),
+        "results": results,
+        "latency_ms": latency_ms,
+        "semantic_weight": req.semantic_weight,
+        "has_embedding": query_embedding is not None,
+    }
+
+
+class AuditSearchRequest(BaseModel):
+    source: Optional[str] = None
+    limit: int = Field(default=50, ge=1, le=200)
+    since: Optional[str] = None
+
+
+@app.post("/mcp/audit/search")
+async def audit_search(req: AuditSearchRequest) -> dict:
+    """Query search audit logs."""
+    with db_conn() as db:
+        conditions = []
+        params: list[Any] = []
+        if req.source:
+            conditions.append("source=?")
+            params.append(req.source)
+        if req.since:
+            conditions.append("created_at >= ?")
+            params.append(req.since)
+        where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+        sql = f"SELECT * FROM search_audit_log {where} ORDER BY created_at DESC LIMIT ?"
+        rows = db.execute(sql, params + [req.limit]).fetchall()
+    return {"success": True, "count": len(rows), "audit_logs": [dict(r) for r in rows]}
+
+
+class CleanupRequest(BaseModel):
+    confirm: bool = False
+
+
+@app.post("/mcp/cleanup")
+async def cleanup_memories(req: CleanupRequest) -> dict:
+    """Apply memory decay: archive expired + demote cold memories."""
+    if not req.confirm:
+        return {
+            "success": False,
+            "error": "Set confirm=true to proceed. This will archive expired memories.",
+            "policy": {"ttl": DEFAULT_TTL, "recall_threshold": DECAY_THRESHOLD},
+        }
+    with db_conn() as db:
+        stats = _apply_decay(db)
+    hot_cache.clear()  # invalidate cache after cleanup
+    return {"success": True, "stats": stats, "cache_cleared": True}
+
+
+@app.get("/mcp/cache/stats")
+async def cache_stats() -> dict:
+    """Get hot cache statistics."""
+    return {
+        "success": True,
+        "cache_size": hot_cache.size,
+        "cache_max": HOT_CACHE_MAX,
+        "cache_ttl_seconds": HOT_CACHE_TTL,
+    }
+
+
 @app.get("/mcp/get/{memory_id}")
 async def get_memory(memory_id: str) -> dict:
     with db_conn() as db:
@@ -1608,6 +2129,9 @@ async def update_memory(memory_id: str, req: UpdateRequest) -> dict:
         if not existing:
             raise HTTPException(status_code=404, detail=f"Memory {memory_id} not found")
 
+        # ── Vector clock conflict detection ──
+        vc_result = _update_vector_clock(db, memory_id, "api")
+
         updates = []
         params: list[Any] = []
 
@@ -1618,6 +2142,11 @@ async def update_memory(memory_id: str, req: UpdateRequest) -> dict:
             params.append(compute_checksum(req.content))
             updates.append("simhash=?")
             params.append(compute_simhash(req.content))
+            # Re-compute embedding if content changed
+            embedding_blob = _compute_embedding(req.content.strip())
+            if embedding_blob:
+                updates.append("embedding=?")
+                params.append(embedding_blob)
         if req.type is not None:
             updates.append("type=?")
             params.append(req.type)
@@ -1661,7 +2190,15 @@ async def update_memory(memory_id: str, req: UpdateRequest) -> dict:
                 change_reason="Content updated via API"
             )
 
-    return {"success": True, "action": "updated", "id": memory_id}
+        # Invalidate hot cache for this memory
+        hot_cache.invalidate(memory_id)
+
+    return {
+        "success": True,
+        "action": "updated",
+        "id": memory_id,
+        "vector_clock": vc_result,
+    }
 
 
 @app.delete("/mcp/delete/{memory_id}")
@@ -1947,6 +2484,23 @@ async def stats() -> dict:
         base_stats["by_priority"] = by_priority
         base_stats["sync"] = {"healthy": sync_healthy, "total": sync_total}
         base_stats["relations"] = relation_count
+        # V5: hot/cold tier stats
+        hot_count = db.execute(
+            "SELECT COUNT(*) FROM memories WHERE archived=0 AND hot_tier=1"
+        ).fetchone()[0]
+        cold_count = db.execute(
+            "SELECT COUNT(*) FROM memories WHERE archived=0 AND hot_tier=0"
+        ).fetchone()[0]
+        by_hot_tier = {"hot": hot_count, "cold": cold_count}
+        # V5: decay stats
+        archived_count = db.execute(
+            "SELECT COUNT(*) FROM memories WHERE archived=1"
+        ).fetchone()[0]
+        audit_total = db.execute(
+            "SELECT COUNT(*) FROM search_audit_log"
+        ).fetchone()[0]
+        base_stats["tier"] = by_hot_tier
+        base_stats["decay"] = {"archived_total": archived_count, "audit_logs": audit_total}
     return base_stats
 
 
@@ -2149,6 +2703,52 @@ MCP_TOOLS = [
             },
             "required": ["persona_type", "name"]
         }
+    },
+    {
+        "name": "mem_search_hybrid",
+        "description": "混合搜索：结合FTS5关键词匹配和embedding语义相似度。支持调整语义权重（0.0=纯关键词，1.0=纯语义）。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "搜索关键词"},
+                "category_filter": {"type": "string", "description": "分类过滤"},
+                "type_filter": {"type": "string", "description": "类型过滤"},
+                "semantic_weight": {"type": "number", "description": "语义权重（0.0-1.0，默认0.4）", "default": 0.4},
+                "limit": {"type": "integer", "description": "返回数量", "default": 10}
+            },
+            "required": ["query"]
+        }
+    },
+    {
+        "name": "mem_cleanup",
+        "description": "触发记忆衰减和过期清理。归档超期P2记忆，降级冷记忆的热度。需要确认参数。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "confirm": {"type": "boolean", "description": "确认执行清理操作", "default": False}
+            },
+            "required": ["confirm"]
+        }
+    },
+    {
+        "name": "mem_audit_search",
+        "description": "查询检索审计日志。查看历史搜索记录、延迟、命中率。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "source": {"type": "string", "description": "来源过滤（hermes/claude/workbuddy）"},
+                "since": {"type": "string", "description": "ISO8601起始时间"},
+                "limit": {"type": "integer", "description": "返回数量", "default": 50}
+            }
+        }
+    },
+    {
+        "name": "mem_cache_stats",
+        "description": "查看热缓存（Hot Cache）统计：缓存大小、最大容量、TTL。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {}
+        }
     }
 ]
 
@@ -2167,7 +2767,7 @@ async def handle_mcp_initialize(request_id: Any, params: dict) -> dict:
             },
             "serverInfo": {
                 "name": "memory-gateway",
-                "version": "4.1.0"
+                "version": "5.0.0"
             }
         }
     }
@@ -2313,6 +2913,35 @@ async def handle_mcp_tools_call(request_id: Any, params: dict) -> dict:
             )
             text = json.dumps(result, ensure_ascii=False)
 
+        elif tool_name == "mem_search_hybrid":
+            hybrid_req = SearchHybridRequest(
+                q=arguments.get("query", arguments.get("q", "")),
+                category_filter=arguments.get("category_filter"),
+                type_filter=arguments.get("type_filter"),
+                limit=arguments.get("limit", 10),
+                semantic_weight=arguments.get("semantic_weight", 0.4),
+            )
+            result = await search_hybrid(hybrid_req)
+            text = json.dumps(result, ensure_ascii=False)
+
+        elif tool_name == "mem_cleanup":
+            result = await cleanup_memories(CleanupRequest(
+                confirm=arguments.get("confirm", False)
+            ))
+            text = json.dumps(result, ensure_ascii=False)
+
+        elif tool_name == "mem_audit_search":
+            result = await audit_search(AuditSearchRequest(
+                source=arguments.get("source"),
+                since=arguments.get("since"),
+                limit=arguments.get("limit", 50),
+            ))
+            text = json.dumps(result, ensure_ascii=False)
+
+        elif tool_name == "mem_cache_stats":
+            result = await cache_stats()
+            text = json.dumps(result, ensure_ascii=False)
+
         else:
             return {
                 "jsonrpc": "2.0",
@@ -2436,13 +3065,24 @@ async def batch_save(req: BatchSaveRequest) -> dict:
             if near_dup:
                 skipped += 1
                 continue
+
+            # Compute embedding (optional, best-effort)
+            embedding_blob = _compute_embedding(mem.content.strip())
+            init_clock = json.dumps({mem.source: now})
+
             db.execute(
                 """INSERT INTO memories
                    (id, content, type, scope, source, priority, confidence, tags, category_id,
+                    embedding, hot_tier, ttl_days, vector_clock,
                     created_at, updated_at, recall_count, archived, checksum, simhash)
-                   VALUES (?, ?, ?, ?, ?, ?, 0.8, ?, ?, ?, ?, 0, 0, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, 0.8, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?)""",
                 (memory_id, mem.content.strip(), mem_type, mem.scope,
-                 mem.source, mem.priority or "P1", tags_json, category_id, now, now, checksum, simhash_val),
+                 mem.source, mem.priority or "P1", tags_json, category_id,
+                 embedding_blob,
+                 1 if (mem.priority or "P1") == "P0" else 0,
+                 DEFAULT_TTL.get(mem.priority or "P1", 0),
+                 init_clock,
+                 now, now, checksum, simhash_val),
             )
 
             if mem.session_id:
@@ -2468,6 +3108,50 @@ async def batch_save(req: BatchSaveRequest) -> dict:
             saved += 1
             ids.append(memory_id)
     return {"success": True, "saved": saved, "skipped": skipped, "ids": ids}
+
+
+# ── Batch Delete ─────────────────────────────────────────
+
+
+class BatchDeleteRequest(BaseModel):
+    source: str = "system"
+    category_id: str = "learning"
+    confirm: bool = False
+
+
+@app.post("/mcp/batch_delete")
+async def batch_delete(req: BatchDeleteRequest) -> dict:
+    """批量删除记忆（按 source + category）。"""
+    if not req.confirm:
+        return {"error": "Set confirm=true to proceed with deletion"}
+
+    with db_conn() as db:
+        count = db.execute(
+            "SELECT COUNT(*) FROM memories WHERE source=? AND category_id=?",
+            (req.source, req.category_id),
+        ).fetchone()[0]
+
+        if count == 0:
+            return {"success": True, "deleted": 0, "message": "No matching memories found"}
+
+        for table in ["session_memories", "change_log", "raw_memories",
+                       "memory_versions", "evolution_log", "memory_branches"]:
+            db.execute(f"""
+                DELETE FROM {table} WHERE memory_id IN
+                (SELECT id FROM memories WHERE source=? AND category_id=?)
+            """, (req.source, req.category_id))
+
+        db.execute(
+            "DELETE FROM memories WHERE source=? AND category_id=?",
+            (req.source, req.category_id),
+        )
+
+        db.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
+
+        log.info("Batch deleted %d memories (source=%s, category=%s)", count, req.source, req.category_id)
+
+    return {"success": True, "deleted": count, "source": req.source, "category": req.category_id}
+
 
 class SetKeyRequest(BaseModel):
     key: str = Field(..., min_length=16, max_length=256)
