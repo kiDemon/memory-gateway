@@ -1753,7 +1753,7 @@ async def search_memory(req: SearchRequest) -> dict:
     t_start = time.time()
     with db_conn() as db:
         # ── Hot cache check ──
-        cache_key = f"search:{req.q}:{req.category_filter}:{req.type_filter}:{req.source_filter}"
+        cache_key = f"search:{req.q}:{req.category_filter}:{req.type_filter}:{req.source_filter}:{req.limit}"
         cached = hot_cache.get(cache_key)
         if cached:
             return {
@@ -2031,7 +2031,24 @@ async def search_hybrid(req: SearchHybridRequest) -> dict:
             ORDER BY fts.rank
             LIMIT ?
         """
-        rows = db.execute(sql, [fts_query] + params + [req.limit]).fetchall()
+        fts_params = [fts_query] + params + [req.limit]
+
+        try:
+            rows = db.execute(sql, fts_params).fetchall()
+            search_type = "fts5"
+        except sqlite3.OperationalError:
+            # FTS query syntax error, fallback to LIKE
+            like_q = f"%{req.q}%"
+            sql_fallback = f"""
+                SELECT m.*, 0 as rank
+                FROM memories m
+                WHERE m.content LIKE ? AND {where}
+                ORDER BY m.created_at DESC
+                LIMIT ?
+            """
+            params_fallback = [like_q] + params + [req.limit]
+            rows = db.execute(sql_fallback, params_fallback).fetchall()
+            search_type = "like_fallback"
 
         query_embedding = _compute_embedding(req.q) if len(req.q) >= 3 else None
         results = _hybrid_search(db, req.q, query_embedding, list(rows),
@@ -2040,13 +2057,23 @@ async def search_hybrid(req: SearchHybridRequest) -> dict:
         latency_ms = round((time.time() - t_start) * 1000, 2)
         ids = [r["id"] for r in results]
 
+        # Update recall stats + promote hot tier (batch)
+        if ids:
+            now = now_iso()
+            placeholders = ",".join("?" for _ in ids)
+            db.execute(
+                f"UPDATE memories SET last_recalled=?, recall_count=recall_count+1 WHERE id IN ({placeholders})",
+                [now] + ids,
+            )
+            _sync_hot_tier_from_cache(db)
+
         # Audit log
         db.execute(
             """INSERT INTO search_audit_log
                (query, source, result_count, result_ids, latency_ms, search_type, hit_cache)
-               VALUES (?, ?, ?, ?, ?, 'hybrid', 0)""",
+               VALUES (?, ?, ?, ?, ?, ?, 0)""",
             (req.q, req.source_filter or "unknown", len(results),
-             json.dumps(ids[:20]), latency_ms),
+             json.dumps(ids[:20]), latency_ms, search_type),
         )
 
     return {
