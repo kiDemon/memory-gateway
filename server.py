@@ -605,11 +605,6 @@ class HotCache:
 hot_cache = HotCache()
 
 
-def _promote_to_hot(db: sqlite3.Connection, memory_id: str) -> None:
-    """Promote a memory to hot tier (hot_tier=1)."""
-    db.execute("UPDATE memories SET hot_tier=1 WHERE id=?", (memory_id,))
-
-
 def _sync_hot_tier_from_cache(db: sqlite3.Connection) -> None:
     """Periodically sync hot tier status: P0 + frequently recalled → hot_tier=1."""
     db.execute("""
@@ -684,7 +679,11 @@ def _compute_embedding(content: str) -> bytes | None:
     model = _get_embed_model()
     if model is None:
         return None
-    vec = model.encode(content, normalize_embeddings=True).tolist()
+    try:
+        vec = model.encode(content, normalize_embeddings=True).tolist()
+    except Exception as e:
+        log.warning(f"Embedding computation failed: {e}")
+        return None
     return _vector_to_blob(vec)
 
 
@@ -748,7 +747,7 @@ def _apply_decay(db: sqlite3.Connection) -> dict:
     Returns stats about what was done.
     """
     now = now_iso()
-    stats = {"archived": 0, "decayed": 0, "errors": 0}
+    stats = {"archived": 0, "decayed": 0}
 
     # 1. Archive memories past their TTL
     for priority, ttl_days in DEFAULT_TTL.items():
@@ -2021,34 +2020,48 @@ async def search_hybrid(req: SearchHybridRequest) -> dict:
 
         where = " AND ".join(conditions)
         safe_q = req.q.replace('"', '""')
-        fts_query = f'"{safe_q}"'
 
-        sql = f"""
-            SELECT m.*, fts.rank
-            FROM memories_fts fts
-            JOIN memories m ON m.rowid = fts.rowid
-            WHERE memories_fts MATCH ? AND {where}
-            ORDER BY fts.rank
-            LIMIT ?
-        """
-        fts_params = [fts_query] + params + [req.limit]
-
-        try:
-            rows = db.execute(sql, fts_params).fetchall()
-            search_type = "fts5"
-        except sqlite3.OperationalError:
-            # FTS query syntax error, fallback to LIKE
+        # Short queries (< 3 chars) use LIKE directly
+        if len(req.q) < 3:
             like_q = f"%{req.q}%"
-            sql_fallback = f"""
+            sql = f"""
                 SELECT m.*, 0 as rank
                 FROM memories m
                 WHERE m.content LIKE ? AND {where}
                 ORDER BY m.created_at DESC
                 LIMIT ?
             """
-            params_fallback = [like_q] + params + [req.limit]
-            rows = db.execute(sql_fallback, params_fallback).fetchall()
-            search_type = "like_fallback"
+            rows = db.execute(sql, [like_q] + params + [req.limit]).fetchall()
+            search_type = "like"
+        else:
+            fts_query = f'"{safe_q}"'
+
+            sql = f"""
+                SELECT m.*, fts.rank
+                FROM memories_fts fts
+                JOIN memories m ON m.rowid = fts.rowid
+                WHERE memories_fts MATCH ? AND {where}
+                ORDER BY fts.rank
+                LIMIT ?
+            """
+            fts_params = [fts_query] + params + [req.limit]
+
+            try:
+                rows = db.execute(sql, fts_params).fetchall()
+                search_type = "fts5"
+            except sqlite3.OperationalError:
+                # FTS query syntax error, fallback to LIKE
+                like_q = f"%{req.q}%"
+                sql_fallback = f"""
+                    SELECT m.*, 0 as rank
+                    FROM memories m
+                    WHERE m.content LIKE ? AND {where}
+                    ORDER BY m.created_at DESC
+                    LIMIT ?
+                """
+                params_fallback = [like_q] + params + [req.limit]
+                rows = db.execute(sql_fallback, params_fallback).fetchall()
+                search_type = "like_fallback"
 
         query_embedding = _compute_embedding(req.q) if len(req.q) >= 3 else None
         results = _hybrid_search(db, req.q, query_embedding, list(rows),
@@ -2183,6 +2196,11 @@ async def update_memory(memory_id: str, req: UpdateRequest) -> dict:
         if req.priority is not None:
             updates.append("priority=?")
             params.append(req.priority)
+            # Recalculate ttl_days and hot_tier when priority changes
+            updates.append("ttl_days=?")
+            params.append(DEFAULT_TTL.get(req.priority, 0))
+            updates.append("hot_tier=?")
+            params.append(1 if req.priority == "P0" else 0)
         if req.category_id is not None:
             updates.append("category_id=?")
             params.append(req.category_id)
@@ -2217,8 +2235,8 @@ async def update_memory(memory_id: str, req: UpdateRequest) -> dict:
                 change_reason="Content updated via API"
             )
 
-        # Invalidate hot cache for this memory
-        hot_cache.invalidate(memory_id)
+        # Invalidate hot cache (search results may include this memory)
+        hot_cache.clear()
 
     return {
         "success": True,
@@ -2244,6 +2262,7 @@ async def delete_memory(memory_id: str) -> dict:
         db.execute("DELETE FROM memories WHERE id=?", (memory_id,))
 
         log.info(f"Memory {memory_id[:8]}... deleted with all related data")
+        hot_cache.clear()
     return {"success": True, "action": "deleted", "id": memory_id}
 
 
@@ -3176,6 +3195,7 @@ async def batch_delete(req: BatchDeleteRequest) -> dict:
         db.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
 
         log.info("Batch deleted %d memories (source=%s, category=%s)", count, req.source, req.category_id)
+        hot_cache.clear()
 
     return {"success": True, "deleted": count, "source": req.source, "category": req.category_id}
 
