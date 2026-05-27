@@ -3097,6 +3097,18 @@ MCP_TOOLS = [
             },
             "required": ["action"]
         }
+    },
+    {
+        "name": "mem_evolve",
+        "description": "CSSF自进化协议：分析记忆使用模式，生成元洞察（哪些知识被频繁使用、哪些被遗忘），自动优化记忆优先级。建议每周运行一次。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["analyze", "optimize", "insights"], "description": "操作类型：analyze=分析模式，optimize=自动优化优先级，insights=生成元洞察"},
+                "days": {"type": "integer", "description": "分析时间窗口（天）", "default": 30}
+            },
+            "required": ["action"]
+        }
     }
 ]
 
@@ -3458,6 +3470,152 @@ async def handle_mcp_tools_call(request_id: Any, params: dict) -> dict:
                         "log": merge_log[:20],
                         "message": f"合并完成：归档 {merged} 条冗余记忆" if merged > 0 else "无需合并，记忆库无冗余"
                     }
+                else:
+                    result = {"error": f"Unknown action: {action}"}
+
+            text = json.dumps(result, ensure_ascii=False, default=str)
+
+        elif tool_name == "mem_evolve":
+            action = arguments.get("action", "analyze")
+            days = arguments.get("days", 30)
+
+            with db_conn() as db:
+                if action == "analyze":
+                    # Analyze memory usage patterns
+                    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+                    
+                    # Top recalled memories (valuable knowledge)
+                    top_recalled = db.execute(
+                        "SELECT id, content, type, category_id, recall_count, confidence, priority "
+                        "FROM memories WHERE archived=0 AND recall_count > 0 "
+                        "ORDER BY recall_count DESC LIMIT 10"
+                    ).fetchall()
+                    
+                    # Never recalled (potentially stale)
+                    never_recalled = db.execute(
+                        "SELECT id, content, type, category_id, created_at, priority "
+                        "FROM memories WHERE archived=0 AND recall_count=0 "
+                        "AND created_at < ? ORDER BY created_at ASC LIMIT 10",
+                        (cutoff,)
+                    ).fetchall()
+                    
+                    # High confidence (trusted knowledge)
+                    high_confidence = db.execute(
+                        "SELECT id, content, type, category_id, confidence "
+                        "FROM memories WHERE archived=0 AND confidence > 0.9 "
+                        "ORDER BY confidence DESC LIMIT 10"
+                    ).fetchall()
+                    
+                    # Category distribution
+                    category_dist = {}
+                    for row in db.execute(
+                        "SELECT category_id, COUNT(*) as c FROM memories WHERE archived=0 GROUP BY category_id"
+                    ):
+                        category_dist[row["category_id"]] = row["c"]
+                    
+                    # Type distribution
+                    type_dist = {}
+                    for row in db.execute(
+                        "SELECT type, COUNT(*) as c FROM memories WHERE archived=0 GROUP BY type"
+                    ):
+                        type_dist[row["type"]] = row["c"]
+                    
+                    result = {
+                        "analysis_period_days": days,
+                        "top_recalled": [dict(r) for r in top_recalled],
+                        "never_recalled_stale": [dict(r) for r in never_recalled],
+                        "high_confidence": [dict(r) for r in high_confidence],
+                        "category_distribution": category_dist,
+                        "type_distribution": type_dist,
+                        "patterns": []
+                    }
+                    
+                    # Detect patterns
+                    if len(top_recalled) > 0:
+                        avg_recall = sum(r["recall_count"] for r in top_recalled) / len(top_recalled)
+                        result["patterns"].append(
+                            f"Top {len(top_recalled)} memories have avg recall {avg_recall:.1f} times"
+                        )
+                    
+                    if len(never_recalled) > 5:
+                        result["patterns"].append(
+                            f"{len(never_recalled)} memories older than {days} days never recalled — consider archiving"
+                        )
+
+                elif action == "optimize":
+                    # Auto-optimize: promote high-recall memories, demote stale ones
+                    promoted = 0
+                    demoted = 0
+                    
+                    # Promote: recall_count >= 5 and P2 → upgrade to P1
+                    rows = db.execute(
+                        "SELECT id, priority FROM memories WHERE archived=0 AND recall_count >= 5 AND priority = 'P2'"
+                    ).fetchall()
+                    for r in rows:
+                        db.execute("UPDATE memories SET priority='P1', ttl_days=180 WHERE id=?", (r["id"],))
+                        promoted += 1
+                    
+                    # Demote: never recalled in 90 days and P1 → downgrade to P2
+                    cutoff_90 = (datetime.now(timezone.utc) - timedelta(days=90)).isoformat()
+                    rows = db.execute(
+                        "SELECT id FROM memories WHERE archived=0 AND recall_count=0 "
+                        "AND created_at < ? AND priority = 'P1'",
+                        (cutoff_90,)
+                    ).fetchall()
+                    for r in rows:
+                        db.execute("UPDATE memories SET priority='P2', ttl_days=60 WHERE id=?", (r["id"],))
+                        demoted += 1
+                    
+                    if promoted > 0 or demoted > 0:
+                        hot_cache.clear()
+                    
+                    result = {
+                        "promoted_p2_to_p1": promoted,
+                        "demoted_p1_to_p2": demoted,
+                        "message": f"优化完成：提升 {promoted} 条高频记忆，降级 {demoted} 条冷门记忆"
+                    }
+
+                elif action == "insights":
+                    # Generate meta-insights about memory usage
+                    total = db.execute("SELECT COUNT(*) FROM memories WHERE archived=0").fetchone()[0]
+                    avg_confidence = db.execute("SELECT AVG(confidence) FROM memories WHERE archived=0").fetchone()[0] or 0
+                    avg_recall = db.execute("SELECT AVG(recall_count) FROM memories WHERE archived=0").fetchone()[0] or 0
+                    
+                    # Find knowledge gaps: categories with few memories
+                    category_counts = {}
+                    for row in db.execute(
+                        "SELECT category_id, COUNT(*) as c FROM memories WHERE archived=0 GROUP BY category_id"
+                    ):
+                        category_counts[row["category_id"]] = row["c"]
+                    
+                    gaps = []
+                    for cat_id, count in category_counts.items():
+                        if count < 3:
+                            gaps.append(f"{cat_id}: 仅 {count} 条记忆，建议补充")
+                    
+                    # Find stale knowledge
+                    stale_cutoff = (datetime.now(timezone.utc) - timedelta(days=60)).isoformat()
+                    stale_count = db.execute(
+                        "SELECT COUNT(*) FROM memories WHERE archived=0 AND recall_count=0 AND created_at < ?",
+                        (stale_cutoff,)
+                    ).fetchone()[0]
+                    
+                    result = {
+                        "total_memories": total,
+                        "avg_confidence": round(avg_confidence, 3),
+                        "avg_recall_count": round(avg_recall, 2),
+                        "knowledge_gaps": gaps,
+                        "stale_memories_60d": stale_count,
+                        "health_score": min(100, int(avg_confidence * 50 + min(avg_recall, 5) * 10)),
+                        "recommendations": []
+                    }
+                    
+                    if stale_count > 10:
+                        result["recommendations"].append("建议运行 mem_evolve(action='optimize') 清理冷门记忆")
+                    if avg_confidence < 0.7:
+                        result["recommendations"].append("平均置信度偏低，建议检查低质量记忆来源")
+                    if not gaps and stale_count == 0:
+                        result["recommendations"].append("记忆库状态优秀，无需优化")
                 else:
                     result = {"error": f"Unknown action: {action}"}
 
