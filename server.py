@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-MCP Memory Server v4 — Hermes + Claude Code + WorkBuddy 统一记忆系统
-部署: 阿里云 1Panel / Docker / 本地
+MCP Memory Server — Hermes + Claude Code + WorkBuddy 统一记忆系统
+部署: Docker / 本地
 协议: MCP over HTTP (StreamableHTTP)
 存储: SQLite + FTS5
 """

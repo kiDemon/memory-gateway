@@ -209,13 +209,13 @@ curl http://localhost:8650/health
 curl -X POST http://localhost:8650/mcp/save \
   -H "Content-Type: application/json" \
   -H "X-API-Key: <your-api-key>" \
-  -d '{"content":"丽江铁塔采用 JWT 中间件认证","source":"hermes","priority":"P1"}'
+  -d '{"content":"项目采用 JWT 中间件认证","source":"hermes","priority":"P1"}'
 
 # 搜索
 curl -X POST http://localhost:8650/mcp/search \
   -H "Content-Type: application/json" \
   -H "X-API-Key: <your-api-key>" \
-  -d '{"q":"丽江铁塔 认证","limit":5}'
+  -d '{"q":"JWT 认证","limit":5}'
 
 # 查看统计
 curl http://localhost:8650/mcp/stats
@@ -448,23 +448,23 @@ Dashboard 支持 API Key 认证：首次打开会显示登录页，输入 API Ke
 
 ## 与类似项目对比
 
-|| 维度 | Memory Gateway | agentmemory | Honcho | Mem0 | Claude Memory Files |
-||------|---------------|-------------|--------|------|-------------------|
-|| **部署** | 自部署 (Docker) | 自部署 (npm) | 云端/自部署 | 云端/自部署 | Anthropic 内建 |
-|| **存储** | SQLite+FTS5 | 内存+文件 | PostgreSQL | 向量数据库 | 文件系统 |
-|| **去重** | SHA256+SimHash | LLM 去重 | 会话级 | 语义去重 | ~ |
-|| **版本控制** | Git-like (diff/分支/回滚) | ~ | ~ | ~ | ~ |
-|| **衰减** | 艾宾浩斯曲线 | 艾宾浩斯曲线 | 会话窗口 | 自定义 | Dreams 整合 |
-|| **语义搜索** | 可选 (sentence-transformers) | BM25+向量+图谱 | 向量检索 | 向量检索 | 按需检索 |
-|| **知识图谱** | ✅ 自动抽取关键词共现 | 自动抽取+图谱遍历 | ~ | ~ | ~ |
-|| **Dreams 整合** | ✅ 扫描相似/矛盾+自动合并 | ~ | ~ | ~ | Dreams 整合 |
-|| **CSSF 自进化** | ✅ analyze/optimize/insights | ✅ 5步螺旋 | ~ | ~ | ~ |
-|| **隐私过滤** | ✅ 内置 | ✅ hooks 层 | ~ | ~ | ~ |
-|| **MCP 协议** | ✅ 原生 | ✅ MCP Server | ❌ | ❌ | ❌ |
-|| **多Agent冲突** | ✅ 向量时钟 | ❌ | ✅ session级 | ❌ | Dreams 整合 |
-|| **Dashboard** | ✅ 内建（认证保护） | ✅ Viewer | ❌ | ❌ | ❌ |
-|| **开源** | ✅ MIT | ✅ MIT | ✅ Apache 2 | ✅ Apache 2 | ❌ 闭源 |
-|| **跨工具** | Hermes+Claude+WorkBuddy | Claude Code+Codex+Cursor | Hermes | Hermes | Claude 生态 |
+| 维度 | Memory Gateway | agentmemory | Honcho | Mem0 | Claude Memory Files |
+|------|---------------|-------------|--------|------|---------------------|
+| **部署** | 自部署 (Docker) | 自部署 (npm) | 云端/自部署 | 云端/自部署 | Anthropic 内建 |
+| **存储** | SQLite+FTS5 | 内存+文件 | PostgreSQL | 向量数据库 | 文件系统 |
+| **去重** | SHA256+SimHash | LLM 去重 | 会话级 | 语义去重 | ~ |
+| **版本控制** | Git-like (diff/分支/回滚) | ~ | ~ | ~ | ~ |
+| **衰减** | 艾宾浩斯曲线 | 艾宾浩斯曲线 | 会话窗口 | 自定义 | Dreams 整合 |
+| **语义搜索** | 可选 (sentence-transformers) | BM25+向量+图谱 | 向量检索 | 向量检索 | 按需检索 |
+| **知识图谱** | ✅ 自动抽取关键词共现 | 自动抽取+图谱遍历 | ~ | ~ | ~ |
+| **Dreams 整合** | ✅ 扫描相似/矛盾+自动合并 | ~ | ~ | ~ | Dreams 整合 |
+| **CSSF 自进化** | ✅ analyze/optimize/insights | ✅ 5步螺旋 | ~ | ~ | ~ |
+| **隐私过滤** | ✅ 内置 | ✅ hooks 层 | ~ | ~ | ~ |
+| **MCP 协议** | ✅ 原生 | ✅ MCP Server | ❌ | ❌ | ❌ |
+| **多Agent冲突** | ✅ 向量时钟 | ❌ | ✅ session级 | ❌ | Dreams 整合 |
+| **Dashboard** | ✅ 内建（认证保护） | ✅ Viewer | ❌ | ❌ | ❌ |
+| **开源** | ✅ MIT | ✅ MIT | ✅ Apache 2 | ✅ Apache 2 | ❌ 闭源 |
+| **跨工具** | Hermes+Claude+WorkBuddy | Claude Code+Codex+Cursor | Hermes | Hermes | Claude 生态 |
 
 > ~ 表示该功能不存在
 
