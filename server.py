@@ -540,7 +540,6 @@ def compute_simhash(content: str, hashbits: int = 64) -> str:
     SimHash produces similar hashes for similar content.
     Hamming distance < 10 means ~80%+ similarity.
     """
-    import re
     tokens = re.findall(r'[\w\u4e00-\u9fff]+', content.lower())
     if not tokens:
         return "0" * (hashbits // 4)
@@ -612,7 +611,132 @@ def _build_timeline(db: sqlite3.Connection, days: int = 30) -> list[dict]:
 
 # ══════════════════════════════════════════════════════════
 # V5 Optimizations: HotCache, Embedding, Decay, Audit, VClock
+# Knowledge Graph Auto-Extraction
 # ══════════════════════════════════════════════════════════
+
+# ── Knowledge Graph: Auto-extract key terms & co-occurrence ──
+
+# Stop words: common terms that should NOT become graph nodes
+_STOP_WORDS = {
+    "的", "了", "是", "在", "有", "和", "不", "也", "人", "这", "中",
+    "大", "为", "上", "个", "就", "到", "说", "要", "对", "会", "从",
+    "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+    "have", "has", "had", "do", "does", "did", "will", "would", "could",
+    "should", "may", "might", "can", "this", "that", "these", "those",
+    "and", "but", "or", "not", "no", "nor", "so", "yet", "both", "either",
+    "neither", "each", "every", "all", "any", "few", "more", "most", "other",
+    "some", "such", "than", "too", "very", "just", "because", "as", "until",
+    "while", "of", "at", "by", "for", "with", "about", "against", "between",
+    "through", "during", "before", "after", "above", "below", "to", "from",
+    "up", "down", "in", "out", "on", "off", "over", "under", "again",
+    "then", "once", "here", "there", "when", "where", "why", "how", "what",
+    "which", "who", "whom", "whose", "if", "it", "its", "they", "them",
+    "their", "he", "she", "him", "her", "his", "we", "us", "our", "you",
+    "your", "my", "me", "i", "am",
+    "已经", "可以", "没有", "我们", "自己", "什么", "这个", "那个",
+    "一下", "一些", "一样", "不是", "还是", "而且", "因为", "所以",
+    "但是", "如果", "虽然", "只是", "或者", "以及", "然后", "之后",
+    "之前", "需要", "通过", "进行", "使用", "支持", "包含", "提供",
+    "支持", "能够", "可能", "应该", "必须", "一个", "一种", "一条",
+}
+
+
+def _extract_key_terms(content: str) -> list[str]:
+    """Extract key terms from content for knowledge graph nodes.
+
+    Strategy (zero-dependency, no LLM):
+    1. Chinese: extract 2-4 char noun-like substrings via regex
+    2. English: extract capitalized words and technical terms
+    3. Filter stop words and very short tokens
+    Returns up to 12 unique key terms.
+    """
+    terms = set()
+
+    # Chinese: extract sequences of 2-4 Chinese characters (likely nouns/phrases)
+    cn_matches = re.findall(r'[\u4e00-\u9fff]{2,4}', content)
+    for m in cn_matches:
+        if m not in _STOP_WORDS and len(m) >= 2:
+            terms.add(m)
+
+    # English: extract words 3+ chars, prefer capitalized and technical terms
+    en_matches = re.findall(r'[A-Za-z_][A-Za-z0-9_]{2,}', content)
+    for m in en_matches:
+        lower = m.lower()
+        if lower not in _STOP_WORDS and len(m) >= 3:
+            # Keep original case for proper nouns, lowercase for common terms
+            terms.add(m if m[0].isupper() else lower)
+
+    # Deduplicate by lowercase, keep the most "interesting" variant
+    seen = {}
+    for t in terms:
+        key = t.lower()
+        if key not in seen or (t[0].isupper() and not seen[key][0].isupper()):
+            seen[key] = t
+
+    return list(seen.values())[:12]
+
+
+def _auto_create_relations(db: sqlite3.Connection, memory_id: str,
+                           content: str, category_id: str) -> int:
+    """Auto-create knowledge graph edges from co-occurring key terms.
+
+    For each pair of key terms in the same memory, create/upsert a relation
+    with strength incremented. Returns number of relations created/updated.
+    """
+    terms = _extract_key_terms(content)
+    if len(terms) < 2:
+        return 0
+
+    now = now_iso()
+    relations_created = 0
+
+    # Create relations between all pairs (max C(12,2)=66 pairs)
+    for i in range(len(terms)):
+        for j in range(i + 1, len(terms)):
+            src = terms[i]
+            tgt = terms[j]
+            # Use term text as pseudo-IDs in relations table
+            # relation type derived from category context
+            relation_type = f"co_occurs_{category_id}"
+
+            # Upsert: increment strength if relation already exists
+            existing = db.execute(
+                "SELECT strength FROM memory_relations WHERE source_id=? AND target_id=?",
+                (src, tgt)
+            ).fetchone()
+
+            if existing:
+                new_strength = min(10.0, existing["strength"] + 0.1)
+                db.execute(
+                    "UPDATE memory_relations SET strength=?, created_at=? WHERE source_id=? AND target_id=?",
+                    (new_strength, now, src, tgt)
+                )
+            else:
+                db.execute(
+                    """INSERT OR IGNORE INTO memory_relations
+                       (source_id, target_id, relation, strength, created_at)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (src, tgt, relation_type, 1.0, now)
+                )
+            relations_created += 1
+
+    if relations_created > 0:
+        log.debug(f"Auto-created {relations_created} graph edges for memory {memory_id[:8]}")
+    return relations_created
+
+
+def _get_related_terms(db: sqlite3.Connection, term: str, limit: int = 10) -> list[dict]:
+    """Get terms related to a given term via knowledge graph."""
+    rows = db.execute(
+        """SELECT target_id as related, relation, strength
+           FROM memory_relations WHERE source_id=?
+           UNION ALL
+           SELECT source_id as related, relation, strength
+           FROM memory_relations WHERE target_id=?
+           ORDER BY strength DESC LIMIT ?""",
+        (term, term, limit)
+    ).fetchall()
+    return [dict(r) for r in rows]
 
 # ── Hot Cache (LRU in-memory) ────────────────────────────
 
@@ -851,9 +975,10 @@ def _apply_decay(db: sqlite3.Connection) -> dict:
         recall_count = r["recall_count"]
         confidence = r["confidence"]
 
-        # Ebbinghaus half-life: P1 starts at 30d, P2 at 14d, each recall doubles
+        # Ebbinghaus half-life: P1 starts at 30d, P2 at 14d
+        # Logarithmic growth: recall=0→1x, 3→2x, 7→3x, 15→4x (prevents recall>5 making memory immortal)
         half_life = 30 if priority == "P1" else 14
-        half_life *= (recall_count + 1)
+        half_life *= (1 + math.log2(recall_count + 1))
 
         # Days since last recall (or creation if never recalled)
         last_time = r["last_recalled"] or r["created_at"]
@@ -1684,7 +1809,7 @@ async def startup() -> None:
 async def health() -> dict:
     with db_conn() as db:
         count = db.execute("SELECT COUNT(*) FROM memories WHERE archived=0").fetchone()[0]
-    return {"status": "ok", "version": "5.0.0", "memories": count, "db": str(DB_PATH)}
+    return {"status": "ok", "version": "5.1.0", "memories": count, "db": str(DB_PATH)}
 
 
 @app.get("/")
@@ -1775,7 +1900,10 @@ async def save_memory(req: SaveRequest) -> dict:
             (memory_id, content, now),
         )
 
-    return {"success": True, "action": "saved", "id": memory_id, "type": mem_type}
+        # Auto-extract knowledge graph edges from co-occurring terms
+        graph_edges = _auto_create_relations(db, memory_id, content, category_id)
+
+    return {"success": True, "action": "saved", "id": memory_id, "type": mem_type, "graph_edges": graph_edges}
 
 
 # ── 上下文卸载 & 4层渐进存储 ─────────────────────────────
@@ -2621,6 +2749,33 @@ async def delete_relation(source_id: str, target_id: str) -> dict:
     return {"success": True, "action": "deleted"}
 
 
+@app.get("/mcp/graph")
+async def get_graph(term: Optional[str] = None, memory_id: Optional[str] = None, limit: int = 20) -> dict:
+    """Query the knowledge graph: get related terms for a given term or memory."""
+    with db_conn() as db:
+        if memory_id:
+            row = db.execute("SELECT content, category_id FROM memories WHERE id=?", (memory_id,)).fetchone()
+            if row:
+                terms = _extract_key_terms(row["content"])
+                graph = {}
+                for t in terms:
+                    related = _get_related_terms(db, t, limit)
+                    if related:
+                        graph[t] = related
+                return {"memory_id": memory_id, "terms": terms, "graph": graph}
+            else:
+                return {"error": f"Memory {memory_id} not found"}
+        elif term:
+            related = _get_related_terms(db, term, limit)
+            return {"term": term, "related": related, "count": len(related)}
+        else:
+            rows = db.execute(
+                "SELECT source_id, target_id, relation, strength FROM memory_relations ORDER BY strength DESC LIMIT ?",
+                (limit,)
+            ).fetchall()
+            return {"edges": [dict(r) for r in rows], "count": len(rows)}
+
+
 # ── Enhanced Stats ────────────────────────────────────────
 
 
@@ -2917,6 +3072,31 @@ MCP_TOOLS = [
             "type": "object",
             "properties": {}
         }
+    },
+    {
+        "name": "mem_graph",
+        "description": "查询知识图谱：获取与某个术语相关的所有关联术语及其关联强度。支持按记忆ID查询其关键术语。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "term": {"type": "string", "description": "要查询的术语（如'代维'、'Hermes'）"},
+                "memory_id": {"type": "string", "description": "记忆ID（可选，提取该记忆的关键术语）"},
+                "limit": {"type": "integer", "description": "返回关联数量", "default": 10}
+            }
+        }
+    },
+    {
+        "name": "mem_dreams",
+        "description": "Dreams 后台整合：扫描记忆库，发现相似记忆、矛盾记忆，生成整合建议。适合记忆量>100时定期运行。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["scan", "merge", "stats"], "description": "操作类型：scan=扫描矛盾/相似，merge=自动合并，stats=统计"},
+                "category_filter": {"type": "string", "description": "分类过滤（可选）"},
+                "auto_merge": {"type": "boolean", "description": "自动合并相似度>0.9的记忆", "default": False}
+            },
+            "required": ["action"]
+        }
     }
 ]
 
@@ -2935,7 +3115,7 @@ async def handle_mcp_initialize(request_id: Any, params: dict) -> dict:
             },
             "serverInfo": {
                 "name": "memory-gateway",
-                "version": "5.0.0"
+                "version": "5.1.0"
             }
         }
     }
@@ -3105,6 +3285,183 @@ async def handle_mcp_tools_call(request_id: Any, params: dict) -> dict:
                 limit=arguments.get("limit", 50),
             ))
             text = json.dumps(result, ensure_ascii=False)
+
+        elif tool_name == "mem_graph":
+            term = arguments.get("term", "")
+            memory_id = arguments.get("memory_id")
+            limit = arguments.get("limit", 10)
+            with db_conn() as db:
+                if memory_id:
+                    # Extract key terms from a specific memory
+                    row = db.execute("SELECT content, category_id FROM memories WHERE id=?", (memory_id,)).fetchone()
+                    if row:
+                        terms = _extract_key_terms(row["content"])
+                        graph = {}
+                        for t in terms:
+                            related = _get_related_terms(db, t, limit)
+                            if related:
+                                graph[t] = related
+                        result = {"memory_id": memory_id, "terms": terms, "graph": graph}
+                    else:
+                        result = {"error": f"Memory {memory_id} not found"}
+                elif term:
+                    related = _get_related_terms(db, term, limit)
+                    result = {"term": term, "related": related, "count": len(related)}
+                else:
+                    # Return top N strongest edges in the graph
+                    rows = db.execute(
+                        "SELECT source_id, target_id, relation, strength FROM memory_relations ORDER BY strength DESC LIMIT ?",
+                        (limit,)
+                    ).fetchall()
+                    result = {"edges": [dict(r) for r in rows], "count": len(rows)}
+            text = json.dumps(result, ensure_ascii=False)
+
+        elif tool_name == "mem_dreams":
+            action = arguments.get("action", "scan")
+            category_filter = arguments.get("category_filter")
+            auto_merge = arguments.get("auto_merge", False)
+
+            with db_conn() as db:
+                if action == "stats":
+                    total = db.execute("SELECT COUNT(*) FROM memories WHERE archived=0").fetchone()[0]
+                    relations = db.execute("SELECT COUNT(*) FROM memory_relations").fetchone()[0]
+                    # Find potential duplicates via simhash
+                    dupes = db.execute(
+                        "SELECT COUNT(*) FROM memories WHERE archived=0 AND simhash != ''"
+                    ).fetchone()[0]
+                    result = {
+                        "total_memories": total,
+                        "total_relations": relations,
+                        "memories_with_simhash": dupes,
+                        "health": "good" if total < 500 else "consider_running_scan",
+                    }
+
+                elif action == "scan":
+                    # Find similar memory pairs (potential duplicates/contradictions)
+                    conditions = ["archived=0"]
+                    search_params: list[Any] = []
+                    if category_filter:
+                        conditions.append("category_id=?")
+                        search_params.append(category_filter)
+
+                    where = " WHERE " + " AND ".join(conditions)
+                    rows = db.execute(
+                        f"SELECT id, content, simhash, checksum, category_id, type, priority {where} ORDER BY created_at DESC LIMIT 500",
+                        search_params
+                    ).fetchall()
+
+                    similar_pairs = []
+                    contradictions = []
+                    seen_checksums: dict[str, str] = {}
+
+                    for i, r in enumerate(rows):
+                        # Exact duplicate detection via checksum
+                        if r["checksum"] in seen_checksums:
+                            similar_pairs.append({
+                                "id1": seen_checksums[r["checksum"]],
+                                "id2": r["id"],
+                                "reason": "exact_duplicate",
+                                "similarity": 1.0
+                            })
+                        else:
+                            seen_checksums[r["checksum"]] = r["id"]
+
+                        # Fuzzy duplicate detection via simhash
+                        if r["simhash"]:
+                            for j in range(i + 1, min(i + 50, len(rows))):
+                                other = rows[j]
+                                if other["simhash"]:
+                                    dist = hamming_distance(r["simhash"], other["simhash"])
+                                    if dist < 8:  # very similar
+                                        similarity = round(1.0 - dist / 64, 3)
+                                        similar_pairs.append({
+                                            "id1": r["id"],
+                                            "id2": other["id"],
+                                            "reason": "similar_content",
+                                            "similarity": similarity,
+                                            "distance": dist
+                                        })
+
+                        # Contradiction detection: same topic, different type/priority
+                        if r["type"] == "decision":
+                            for j in range(i + 1, min(i + 30, len(rows))):
+                                other = rows[j]
+                                if (other["type"] == "decision" and
+                                    other["category_id"] == r["category_id"] and
+                                    other["id"] != r["id"]):
+                                    # Check if content is different but topic same
+                                    r_terms = set(_extract_key_terms(r["content"]))
+                                    o_terms = set(_extract_key_terms(other["content"]))
+                                    overlap = r_terms & o_terms
+                                    if len(overlap) >= 2:  # same topic
+                                        contradictions.append({
+                                            "id1": r["id"],
+                                            "id2": other["id"],
+                                            "shared_terms": list(overlap)[:5],
+                                            "reason": "same_topic_different_decision"
+                                        })
+
+                    result = {
+                        "scanned": len(rows),
+                        "similar_pairs": similar_pairs[:20],
+                        "contradictions": contradictions[:10],
+                        "suggestions": []
+                    }
+
+                    if similar_pairs:
+                        result["suggestions"].append(
+                            f"发现 {len(similar_pairs)} 对相似记忆，建议合并以减少冗余"
+                        )
+                    if contradictions:
+                        result["suggestions"].append(
+                            f"发现 {len(contradictions)} 对潜在矛盾决策，建议人工审核"
+                        )
+                    if not similar_pairs and not contradictions:
+                        result["suggestions"].append("记忆库状态良好，无明显冗余或矛盾")
+
+                elif action == "merge":
+                    # Auto-merge memories with similarity > 0.9
+                    rows = db.execute(
+                        "SELECT id, content, simhash, checksum, category_id FROM memories WHERE archived=0 AND simhash != '' ORDER BY created_at DESC LIMIT 200"
+                    ).fetchall()
+
+                    merged = 0
+                    merge_log = []
+                    seen: dict[str, str] = {}  # checksum -> id
+
+                    for r in rows:
+                        # Exact duplicate: archive the newer one
+                        if r["checksum"] in seen:
+                            db.execute("UPDATE memories SET archived=1 WHERE id=?", (r["id"],))
+                            merge_log.append({"archived": r["id"], "kept": seen[r["checksum"]], "reason": "exact_duplicate"})
+                            merged += 1
+                        else:
+                            seen[r["checksum"]] = r["id"]
+
+                        # Fuzzy duplicate with high similarity
+                        if r["simhash"] and auto_merge:
+                            for j in range(rows.index(r) + 1, min(rows.index(r) + 30, len(rows))):
+                                other = rows[j]
+                                if other["simhash"] and not other["id"] in [m.get("archived") for m in merge_log]:
+                                    dist = hamming_distance(r["simhash"], other["simhash"])
+                                    if dist < 4:  # very high similarity (~94%+)
+                                        db.execute("UPDATE memories SET archived=1 WHERE id=?", (other["id"],))
+                                        merge_log.append({"archived": other["id"], "kept": r["id"], "reason": "fuzzy_duplicate", "distance": dist})
+                                        merged += 1
+
+                    if merged > 0:
+                        hot_cache.clear()
+                        db.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
+
+                    result = {
+                        "merged": merged,
+                        "log": merge_log[:20],
+                        "message": f"合并完成：归档 {merged} 条冗余记忆" if merged > 0 else "无需合并，记忆库无冗余"
+                    }
+                else:
+                    result = {"error": f"Unknown action: {action}"}
+
+            text = json.dumps(result, ensure_ascii=False, default=str)
 
         elif tool_name == "mem_cache_stats":
             result = await cache_stats()
