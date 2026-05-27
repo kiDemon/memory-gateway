@@ -78,6 +78,10 @@ tr:hover { background:var(--bg3); }
 <div class="header">
   <h1>🧠 Memory Gateway Dashboard</h1>
   <div class="stats" id="headerStats">Loading...</div>
+  <div style="display:flex;align-items:center;gap:8px;">
+    <input type="password" id="apiKeyInput" placeholder="API Key" style="width:130px;font-size:12px;padding:4px 8px;background:var(--bg3);border:1px solid var(--border);color:var(--text);border-radius:4px;">
+    <button class="btn" style="padding:4px 10px;font-size:12px;" onclick="const k=document.getElementById('apiKeyInput').value;localStorage.setItem('mg_api_key',k);showToast('API Key saved')">保存</button>
+  </div>
 </div>
 
 <div id="toast" class="toast"></div>
@@ -86,6 +90,7 @@ tr:hover { background:var(--bg3); }
   <div class="tab active" data-tab="overview">📊 总览</div>
   <div class="tab" data-tab="memories">🔍 记忆浏览器</div>
   <div class="tab" data-tab="evolution">🧬 进化追踪</div>
+  <div class="tab" data-tab="tools">🛠️ 智能工具</div>
   <div class="tab" data-tab="system">⚙️ 系统监控</div>
 </div>
 
@@ -134,6 +139,41 @@ tr:hover { background:var(--bg3); }
   <div id="evolutionResult"></div>
 </div>
 
+<!-- 智能工具 -->
+<div class="content hidden" id="tab-tools">
+  <div class="grid grid-2" style="grid-template-columns:1fr 1fr;">
+    <div class="card">
+      <h3>🔗 知识图谱</h3>
+      <div class="search-bar" style="margin-top:8px;">
+        <input type="text" id="graphTerm" placeholder="搜索词条..." style="flex:1;">
+        <input type="number" id="graphLimit" placeholder="数量" value="10" style="width:70px;">
+        <input type="text" id="graphMemoryId" placeholder="记忆ID" style="width:120px;">
+        <button class="btn" onclick="loadGraph()">查询</button>
+      </div>
+      <div id="graphResult"><div class="loading">输入关键词查询知识图谱</div></div>
+    </div>
+    <div class="card">
+      <h3>💭 梦境处理 (Dreams)</h3>
+      <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap;">
+        <button class="btn" onclick="runDreams('scan')">🔍 扫描</button>
+        <button class="btn" onclick="runDreams('merge')">🔗 合并</button>
+        <button class="btn secondary" onclick="runDreams('stats')">📊 统计</button>
+      </div>
+      <div id="dreamsResult"><div class="loading">点击按钮运行梦境处理</div></div>
+    </div>
+  </div>
+  <div style="height:16px"></div>
+  <div class="card">
+    <h3>🧬 CSSF 自我进化</h3>
+    <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap;">
+      <button class="btn" onclick="runEvolve('analyze')">📋 分析</button>
+      <button class="btn" onclick="runEvolve('optimize')">⚡ 优化</button>
+      <button class="btn secondary" onclick="runEvolve('insights')">💡 洞察</button>
+    </div>
+    <div id="evolveResult"><div class="loading">点击按钮运行自我进化</div></div>
+  </div>
+</div>
+
 <!-- 系统监控 -->
 <div class="content hidden" id="tab-system">
   <div class="grid grid-2">
@@ -155,22 +195,14 @@ const API = '';
 let charts = {};
 let currentPage = 0;
 
-// Tab 切换
-document.querySelectorAll('.tab').forEach(tab => {
-  tab.addEventListener('click', () => {
-    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-    document.querySelectorAll('.content').forEach(c => c.classList.add('hidden'));
-    tab.classList.add('active');
-    document.getElementById('tab-' + tab.dataset.tab).classList.remove('hidden');
-    if (tab.dataset.tab === 'overview') loadOverview();
-    if (tab.dataset.tab === 'memories') searchMemories();
-    if (tab.dataset.tab === 'system') loadSystem();
-  });
-});
+function getApiKey() { return localStorage.getItem('mg_api_key') || ''; }
 
 async function fetchJSON(url) {
   try {
-    const r = await fetch(API + url);
+    const headers = {};
+    const key = getApiKey();
+    if (key) headers['X-API-Key'] = key;
+    const r = await fetch(API + url, { headers });
     if (!r.ok) {
       const msg = `API ${r.status} for ${url}`;
       console.error(msg);
@@ -185,6 +217,41 @@ async function fetchJSON(url) {
     return { error: e.message, memories: [], versions: [], categories: [], sources: [], days: [] };
   }
 }
+
+async function fetchPost(url, body) {
+  try {
+    const headers = { 'Content-Type': 'application/json' };
+    const key = getApiKey();
+    if (key) headers['X-API-Key'] = key;
+    const r = await fetch(API + url, { method: 'POST', headers, body: JSON.stringify(body) });
+    if (!r.ok) {
+      const msg = `API ${r.status} for ${url}`;
+      console.error(msg);
+      showToast(msg);
+      return { error: `HTTP ${r.status}` };
+    }
+    return await r.json();
+  } catch (e) {
+    const msg = `Network error for ${url}: ${e.message}`;
+    console.error(msg);
+    showToast(msg);
+    return { error: e.message };
+  }
+}
+
+// Tab 切换
+document.querySelectorAll('.tab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    document.querySelectorAll('.content').forEach(c => c.classList.add('hidden'));
+    tab.classList.add('active');
+    document.getElementById('tab-' + tab.dataset.tab).classList.remove('hidden');
+    if (tab.dataset.tab === 'overview') loadOverview();
+    if (tab.dataset.tab === 'memories') searchMemories();
+    if (tab.dataset.tab === 'system') loadSystem();
+    if (tab.dataset.tab === 'tools') loadTools();
+  });
+});
 
 function showToast(msg) {
   const el = document.getElementById('toast');
@@ -382,6 +449,52 @@ async function loadSystem() {
     </div>`;
 }
 
+// ═══ 智能工具 ═══
+async function loadGraph() {
+  const term = document.getElementById('graphTerm').value.trim();
+  const memoryId = document.getElementById('graphMemoryId').value.trim();
+  const limit = parseInt(document.getElementById('graphLimit').value) || 10;
+  let url = '/mcp/graph?limit=' + limit;
+  if (term) url += '&term=' + encodeURIComponent(term);
+  if (memoryId) url += '&memory_id=' + encodeURIComponent(memoryId);
+  const d = await fetchJSON(url);
+  const div = document.getElementById('graphResult');
+  if (!d.nodes || d.nodes.length === 0) {
+    div.innerHTML = '<div class="loading">未找到相关节点</div>';
+    return;
+  }
+  div.innerHTML = `<div style="margin-bottom:8px;color:var(--text2);font-size:12px;">节点: ${d.nodes.length} | 边: ${(d.edges||[]).length}</div>
+    <table><tr><th>ID</th><th>标签</th><th>类型</th><th>权重</th></tr>
+    ${d.nodes.map(n => `<tr><td>${escapeHtml((n.id||'').slice(0,16))}</td><td>${escapeHtml(n.label||n.name||'')}</td><td>${escapeHtml(n.type||'')}</td><td>${n.weight||n.score||'-'}</td></tr>`).join('')}
+    </table>`;
+}
+
+async function runDreams(action) {
+  const div = document.getElementById('dreamsResult');
+  div.innerHTML = '<div class="loading">⏳ 梦境处理中...</div>';
+  const d = await fetchPost('/mcp', { tool: 'mem_dreams', action });
+  if (d.error) {
+    div.innerHTML = `<div style="color:var(--red)">错误: ${escapeHtml(d.error)}</div>`;
+    return;
+  }
+  div.innerHTML = `<pre style="white-space:pre-wrap;font-size:13px;background:var(--bg);padding:12px;border-radius:6px;max-height:400px;overflow-y:auto;">${escapeHtml(JSON.stringify(d, null, 2))}</pre>`;
+}
+
+async function runEvolve(action) {
+  const div = document.getElementById('evolveResult');
+  div.innerHTML = '<div class="loading">⏳ 自我进化分析中...</div>';
+  const d = await fetchPost('/mcp', { tool: 'mem_evolve', action });
+  if (d.error) {
+    div.innerHTML = `<div style="color:var(--red)">错误: ${escapeHtml(d.error)}</div>`;
+    return;
+  }
+  div.innerHTML = `<pre style="white-space:pre-wrap;font-size:13px;background:var(--bg);padding:12px;border-radius:6px;max-height:400px;overflow-y:auto;">${escapeHtml(JSON.stringify(d, null, 2))}</pre>`;
+}
+
+function loadTools() {
+  loadGraph();
+}
+
 // 初始化分类筛选器
 async function initCategories() {
   const d = await fetchJSON('/api/dashboard/categories');
@@ -395,6 +508,8 @@ async function initCategories() {
 }
 
 // 启动
+const savedKey = localStorage.getItem('mg_api_key');
+if (savedKey) document.getElementById('apiKeyInput').value = savedKey;
 loadOverview();
 initCategories();
 </script>

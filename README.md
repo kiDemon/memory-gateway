@@ -174,7 +174,9 @@ Agent 保存记忆                          Agent 搜索记忆
     ├─ 置信度打分                           ├─ 置信度加权
     ├─ 向量时钟初始化                        ├─ 召回统计 + 置信度+0.02
     ├─ 写入 SQLite + FTS5                  └─ 审计日志
-    └─ 版本快照创建
+    ├─ 版本快照创建
+    ├─ 知识图谱自动抽取 (关键词→共现关系)
+    └─ 热缓存同步 (P0/procedural)
 ```
 
 ---
@@ -243,11 +245,13 @@ curl http://localhost:8650/mcp/stats
 
 Gateway 默认自动生成 API Key，存储在 `/data/.api_key` 中。也可以通过 Web UI `http://localhost:8650/admin` 或 REST API 进行密钥管理。
 
-所有 API 请求（健康检查和仪表盘除外）需要携带头部：
+所有 API 请求（健康检查除外）需要携带头部：
 
 ```
-X-API-Key: sk-mg-xxxxxxxxxxxxxxxx
+X-API-Key: sk-mg-...xxxx
 ```
+
+Dashboard 和 API 端点都需要认证。Dashboard 首次打开会显示登录页，输入 API Key 后保存到浏览器 localStorage。
 
 ---
 
@@ -397,39 +401,70 @@ call: {"method": "tools/call", "params": {
 }}
 ```
 
+### MCP 工具列表（18个）
+
+| 类别 | 工具 | 说明 |
+|------|------|------|
+| **CRUD** | `mem_save` | 保存记忆（自动去重+类型检测+隐私过滤+知识图谱抽取） |
+| | `mem_search` | 搜索记忆（FTS5+RRF融合+置信度加权） |
+| | `mem_list` | 列出记忆（支持增量同步） |
+| | `mem_delete` | 删除记忆 |
+| | `mem_categories` | 获取分类列表 |
+| | `mem_stats` | 获取统计信息 |
+| **版本控制** | `mem_history` | 查看记忆版本历史 |
+| | `mem_diff` | 对比两个版本差异 |
+| | `mem_rollback` | 回滚到指定版本 |
+| | `mem_branch` | 创建/列出记忆分支 |
+| | `mem_merge` | 合并记忆分支 |
+| **4层存储** | `mem_offload` | 卸载长文本到 L0 原始层 |
+| | `mem_drilldown` | 钻回原始内容 |
+| | `mem_scenario` | 获取场景聚合 |
+| | `mem_persona` | 获取用户/项目画像 |
+| **高级检索** | `mem_search_hybrid` | 混合搜索（FTS5+语义+RRF） |
+| | `mem_audit_search` | 搜索审计日志 |
+| | `mem_cleanup` | 清理过期记忆 |
+| | `mem_cache_stats` | 热缓存统计 |
+| **v5.1 新增** | `mem_graph` | 知识图谱查询（按术语/记忆ID） |
+| | `mem_dreams` | Dreams 后台整合（scan/merge/stats） |
+| | `mem_evolve` | CSSF 自进化（analyze/optimize/insights） |
+
 ---
 
 ## 仪表盘
 
-浏览器打开 `http://your-server:8650/dashboard` 进入管理面板：
+浏览器打开 `http://your-server:8650/dashboard` 进入管理面板（需要 API Key 认证）：
 
 | 功能区 | 内容 |
 |--------|------|
 | **概览** | 记忆总数、活跃/归档统计、按来源分布、按分类分布 |
-| **分类** | 分类树、各分类记忆数量 |
-| **记忆列表** | 所有记忆的搜索/筛选/详情查看 |
-| **记忆详情** | 单条记忆全文、版本历史、关系图谱、进化时间线 |
-| **健康度** | 服务状态、数据库大小、缓存命中率 |
+| **记忆浏览器** | 所有记忆的搜索/筛选/详情查看，支持分类/来源/优先级过滤 |
+| **进化追踪** | 单条记忆的版本历史、diff 对比、进化时间线 |
+| **🛠️ 智能工具** | 知识图谱查询、Dreams 后台整合、CSSF 自进化分析 |
+| **系统监控** | 同步状态、数据库统计、版本控制统计、健康度 |
+
+Dashboard 支持 API Key 认证：首次打开会显示登录页，输入 API Key 后保存到浏览器 localStorage。
 
 ---
 
 ## 与类似项目对比
 
-| 维度 | Memory Gateway | agentmemory | Honcho | Mem0 | Claude Memory Files |
-|------|---------------|-------------|--------|------|-------------------|
-| **部署** | 自部署 (Docker) | 自部署 (npm) | 云端/自部署 | 云端/自部署 | Anthropic 内建 |
-| **存储** | SQLite+FTS5 | 内存+文件 | PostgreSQL | 向量数据库 | 文件系统 |
-| **去重** | SHA256+SimHash | LLM 去重 | 会话级 | 语义去重 | ~ |
-| **版本控制** | Git-like (diff/分支/回滚) | ~ | ~ | ~ | ~ |
-| **衰减** | 艾宾浩斯曲线 | 艾宾浩斯曲线 | 会话窗口 | 自定义 | Dreams 整合 |
-| **语义搜索** | 可选 (sentence-transformers) | BM25+向量+图谱 | 向量检索 | 向量检索 | 按需检索 |
-| **知识图谱** | 关系表 (CRUD) | 自动抽取+图谱遍历 | ~ | ~ | ~ |
-| **隐私过滤** | ✅ 内置 | ✅ hooks 层 | ~ | ~ | ~ |
-| **MCP 协议** | ✅ 原生 | ✅ MCP Server | ❌ | ❌ | ❌ |
-| **多Agent冲突** | ✅ 向量时钟 | ❌ | ✅ session级 | ❌ | Dreams 整合 |
-| **Dashboard** | ✅ 内建 | ✅ Viewer | ❌ | ❌ | ❌ |
-| **开源** | ✅ MIT | ✅ MIT | ✅ Apache 2 | ✅ Apache 2 | ❌ 闭源 |
-| **跨工具** | Hermes+Claude+WorkBuddy | Claude Code+Codex+Cursor | Hermes | Hermes | Claude 生态 |
+|| 维度 | Memory Gateway | agentmemory | Honcho | Mem0 | Claude Memory Files |
+||------|---------------|-------------|--------|------|-------------------|
+|| **部署** | 自部署 (Docker) | 自部署 (npm) | 云端/自部署 | 云端/自部署 | Anthropic 内建 |
+|| **存储** | SQLite+FTS5 | 内存+文件 | PostgreSQL | 向量数据库 | 文件系统 |
+|| **去重** | SHA256+SimHash | LLM 去重 | 会话级 | 语义去重 | ~ |
+|| **版本控制** | Git-like (diff/分支/回滚) | ~ | ~ | ~ | ~ |
+|| **衰减** | 艾宾浩斯曲线 | 艾宾浩斯曲线 | 会话窗口 | 自定义 | Dreams 整合 |
+|| **语义搜索** | 可选 (sentence-transformers) | BM25+向量+图谱 | 向量检索 | 向量检索 | 按需检索 |
+|| **知识图谱** | ✅ 自动抽取关键词共现 | 自动抽取+图谱遍历 | ~ | ~ | ~ |
+|| **Dreams 整合** | ✅ 扫描相似/矛盾+自动合并 | ~ | ~ | ~ | Dreams 整合 |
+|| **CSSF 自进化** | ✅ analyze/optimize/insights | ✅ 5步螺旋 | ~ | ~ | ~ |
+|| **隐私过滤** | ✅ 内置 | ✅ hooks 层 | ~ | ~ | ~ |
+|| **MCP 协议** | ✅ 原生 | ✅ MCP Server | ❌ | ❌ | ❌ |
+|| **多Agent冲突** | ✅ 向量时钟 | ❌ | ✅ session级 | ❌ | Dreams 整合 |
+|| **Dashboard** | ✅ 内建（认证保护） | ✅ Viewer | ❌ | ❌ | ❌ |
+|| **开源** | ✅ MIT | ✅ MIT | ✅ Apache 2 | ✅ Apache 2 | ❌ 闭源 |
+|| **跨工具** | Hermes+Claude+WorkBuddy | Claude Code+Codex+Cursor | Hermes | Hermes | Claude 生态 |
 
 > ~ 表示该功能不存在
 
@@ -471,7 +506,7 @@ MEMORY_DATA_DIR=./data uvicorn server:app --reload --host 0.0.0.0 --port 8650
 
 ```
 memory-gateway/
-├── server.py              # 主服务（3670行，包含所有功能）
+├── server.py              # 主服务（4300+行，包含所有功能）
 ├── Dockerfile             # 生产构建
 ├── docker-compose.yml     # 一键部署
 ├── entrypoint.sh          # 容器入口
@@ -498,13 +533,16 @@ memory-gateway/
 
 ## 路线图
 
-### v5.5（近期）
-- [ ] Dreams 后台整合（跨记忆合并+矛盾检测+模式发现）
-- [ ] 知识图谱自动抽取（save 时 LLM 提取实体关系）
-- [ ] 语义搜索轻量版（onnxruntime + MiniLM，替代 PyTorch）
+### v5.1（已完成）✅
+- [x] Dreams 后台整合（跨记忆合并+矛盾检测+模式发现）
+- [x] 知识图谱自动抽取（save 时自动提取关键词→共现关系）
+- [x] CSSF 自进化协议（mem_evolve: analyze/optimize/insights）
+- [x] Dashboard 智能工具面板（知识图谱/Dreams/CSSF 可视化）
+- [x] Dashboard 认证保护（API Key 认证）
 
 ### v6.0（中期）
-- [ ] Memory Viewer Web App（记忆浏览器 + 关系图谱可视化）
+- [ ] 语义搜索轻量版（onnxruntime + MiniLM，替代 PyTorch）
+- [ ] Memory Viewer Web App（关系图谱可视化）
 - [ ] 多 Provider 存储（可选 PostgreSQL / Redis 后端）
 - [ ] 导入/导出（JSON / Markdown / Obsidian 格式）
 

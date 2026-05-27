@@ -1763,8 +1763,8 @@ async def api_key_middleware(request: Request, call_next):
     if request.url.path == "/admin/login":
         return await call_next(request)
 
-    # Allow dashboard and its API without auth (has its own session if needed)
-    if request.url.path == "/dashboard" or request.url.path.startswith("/api/dashboard/"):
+    # Allow static files (CSS, JS, images) without auth
+    if request.url.path.startswith("/static/"):
         return await call_next(request)
 
     if API_KEY:
@@ -1779,7 +1779,7 @@ async def api_key_middleware(request: Request, call_next):
             return await call_next(request)
 
         # Auth failed — return login page for browser, JSON for API
-        if request.url.path == "/" or request.url.path.startswith("/admin"):
+        if request.url.path == "/" or request.url.path.startswith("/admin") or request.url.path == "/dashboard":
             return HTMLResponse(
                 status_code=401,
                 content=login_page_html(),
