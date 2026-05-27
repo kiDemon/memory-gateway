@@ -512,8 +512,15 @@ async function runDreams(action) {
     jsonrpc: "2.0", id: 1, method: "tools/call",
     params: { name: "mem_dreams", arguments: { action } }
   });
+  // Handle HTTP errors
   if (d.error) {
     div.innerHTML = `<div style="color:var(--red)">错误: ${escapeHtml(typeof d.error === 'string' ? d.error : JSON.stringify(d.error))}</div>`;
+    return;
+  }
+  // Handle MCP protocol errors
+  if (d.result?.isError) {
+    const errText = d.result.content?.[0]?.text || 'Unknown MCP error';
+    div.innerHTML = `<div style="color:var(--red)">MCP错误: ${escapeHtml(errText)}</div>`;
     return;
   }
   // MCP returns {result: {content: [{type:"text", text:"..."}]}}
@@ -530,8 +537,15 @@ async function runEvolve(action) {
     jsonrpc: "2.0", id: 1, method: "tools/call",
     params: { name: "mem_evolve", arguments: { action } }
   });
+  // Handle HTTP errors
   if (d.error) {
     div.innerHTML = `<div style="color:var(--red)">错误: ${escapeHtml(typeof d.error === 'string' ? d.error : JSON.stringify(d.error))}</div>`;
+    return;
+  }
+  // Handle MCP protocol errors
+  if (d.result?.isError) {
+    const errText = d.result.content?.[0]?.text || 'Unknown MCP error';
+    div.innerHTML = `<div style="color:var(--red)">MCP错误: ${escapeHtml(errText)}</div>`;
     return;
   }
   const text = d.result?.content?.[0]?.text || JSON.stringify(d, null, 2);
