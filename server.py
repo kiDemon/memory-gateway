@@ -3363,7 +3363,7 @@ async def handle_mcp_tools_call(request_id: Any, params: dict) -> dict:
 
                     where = " WHERE " + " AND ".join(conditions)
                     rows = db.execute(
-                        f"SELECT id, content, simhash, checksum, category_id, type, priority {where} ORDER BY created_at DESC LIMIT 500",
+                        f"SELECT id, content, simhash, checksum, category_id, type, priority FROM memories {where} ORDER BY created_at DESC LIMIT 500",
                         search_params
                     ).fetchall()
 
