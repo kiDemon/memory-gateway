@@ -3446,7 +3446,7 @@ async def handle_mcp_tools_call(request_id: Any, params: dict) -> dict:
                     merge_log = []
                     seen: dict[str, str] = {}  # checksum -> id
 
-                    for r in rows:
+                    for i, r in enumerate(rows):
                         # Exact duplicate: archive the newer one
                         if r["checksum"] in seen:
                             db.execute("UPDATE memories SET archived=1 WHERE id=?", (r["id"],))
@@ -3457,7 +3457,7 @@ async def handle_mcp_tools_call(request_id: Any, params: dict) -> dict:
 
                         # Fuzzy duplicate with high similarity
                         if r["simhash"] and auto_merge:
-                            for j in range(rows.index(r) + 1, min(rows.index(r) + 30, len(rows))):
+                            for j in range(i + 1, min(i + 30, len(rows))):
                                 other = rows[j]
                                 if other["simhash"] and not other["id"] in [m.get("archived") for m in merge_log]:
                                     dist = hamming_distance(r["simhash"], other["simhash"])
