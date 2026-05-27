@@ -662,9 +662,11 @@ def _extract_key_terms(content: str) -> list[str]:
     en_matches = re.findall(r'[A-Za-z_][A-Za-z0-9_]{2,}', content)
     for m in en_matches:
         lower = m.lower()
-        if lower not in _STOP_WORDS and len(m) >= 3:
-            # Keep original case for proper nouns, lowercase for common terms
-            terms.add(m if m[0].isupper() else lower)
+        # Skip: pure numbers, stop words, very short
+        if lower in _STOP_WORDS or len(m) < 3 or m.isdigit():
+            continue
+        # Keep original case for proper nouns, lowercase for common terms
+        terms.add(m if m[0].isupper() else lower)
 
     # Deduplicate by lowercase, keep the most "interesting" variant
     seen = {}
@@ -1536,7 +1538,7 @@ class VersionManager:
 
 class SaveRequest(BaseModel):
     content: str = Field(..., max_length=100000)
-    type: Optional[str] = Field(default=None, pattern=r"^(general|rule|preference|decision|context|learning|reference|convention)$")
+    type: Optional[str] = Field(default=None, pattern=r"^(general|rule|preference|decision|context|learning|reference|convention|procedural)$")
     scope: Optional[str] = Field(default="global", pattern=r"^(global|project|agent)$")
     source: Optional[str] = Field(default="unknown", pattern=r"^(hermes|claude|workbuddy|system|unknown)$")
     priority: Optional[str] = Field(default="P1", pattern=r"^(P0|P1|P2)$")
@@ -1548,7 +1550,7 @@ class SaveRequest(BaseModel):
 
 class UpdateRequest(BaseModel):
     content: Optional[str] = Field(default=None, max_length=100000)
-    type: Optional[str] = Field(default=None, pattern=r"^(general|rule|preference|decision|context|learning|reference|convention)$")
+    type: Optional[str] = Field(default=None, pattern=r"^(general|rule|preference|decision|context|learning|reference|convention|procedural)$")
     scope: Optional[str] = Field(default=None, pattern=r"^(global|project|agent)$")
     priority: Optional[str] = Field(default=None, pattern=r"^(P0|P1|P2)$")
     category_id: Optional[str] = Field(default=None, pattern=r"^[a-z][a-z0-9_]{0,63}$")
@@ -1902,6 +1904,9 @@ async def save_memory(req: SaveRequest) -> dict:
 
         # Auto-extract knowledge graph edges from co-occurring terms
         graph_edges = _auto_create_relations(db, memory_id, content, category_id)
+
+        # Sync hot tier for new P0/procedural memories
+        _sync_hot_tier_from_cache(db)
 
     return {"success": True, "action": "saved", "id": memory_id, "type": mem_type, "graph_edges": graph_edges}
 
