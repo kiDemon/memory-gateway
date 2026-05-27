@@ -14,6 +14,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY server.py entrypoint.sh ./
+COPY static/ ./static/
 RUN chmod +x entrypoint.sh && mkdir -p /data
 
 EXPOSE 8650
