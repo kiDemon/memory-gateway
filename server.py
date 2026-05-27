@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import difflib
+import re
 import sqlite3
 import sys
 import time
@@ -457,7 +458,76 @@ CONTENT_TYPE_KEYWORDS = {
     "context": ["project", "architecture", "stack", "framework", "project", "项目", "架构", "技术栈"],
     "reference": ["link", "url", "doc", "api", "reference", "文档", "链接", "参考"],
     "convention": ["naming", "format", "style", "indent", "naming", "命名", "格式", "风格"],
+    "procedural": ["流程", "步骤", "标准操作", "checklist", "工作流", "workflow", "procedure", "step by step", "标准作业", "sop", "protocol"],
 }
+
+# ── Privacy Filter ─────────────────────────────────────────
+
+# Patterns to redact before saving: API keys, tokens, passwords
+PRIVACY_PATTERNS = [
+    (re.compile(r'(?i)(api[_-]?key|apikey)\s*[:=]\s*["\']?[A-Za-z0-9_\-]{16,}'), r'\1 [REDACTED]'),
+    (re.compile(r'(?i)(secret|password|token)\s*[:=]\s*["\']?[A-Za-z0-9_\-\.]{8,}'), r'\1 [REDACTED]'),
+    (re.compile(r'(?i)(bearer)\s+[A-Za-z0-9_\-\.]{20,}'), 'Bearer [REDACTED]'),
+    (re.compile(r'(sk-[a-zA-Z0-9]{20,})'), '[API-KEY-REDACTED]'),
+]
+
+
+def _filter_sensitive(content: str) -> str:
+    """Strip sensitive information from content before saving."""
+    result = content
+    for pattern, replacement in PRIVACY_PATTERNS:
+        before = result
+        result = pattern.sub(replacement, result)
+        if result != before:
+            log.debug("Privacy filter redacted content")
+    return result
+
+
+# ── Confidence Score ──────────────────────────────────────
+
+# Default confidence by type (higher = more durable)
+TYPE_CONFIDENCE = {
+    "procedural": 0.95,   # SOPs, workflows → most trusted
+    "rule": 0.90,
+    "convention": 0.90,
+    "decision": 0.85,
+    "preference": 0.85,
+    "learning": 0.80,
+    "context": 0.80,
+    "reference": 0.75,
+    "feature": 0.70,
+    "progress": 0.65,
+    "debugging": 0.60,
+    "general": 0.80,
+}
+
+# Source trust bonus
+SOURCE_CONFIDENCE_BONUS = {
+    "hermes": 0.05,
+    "claude": 0.05,
+    "workbuddy": 0.03,
+    "system": 0.10,
+}
+
+
+def _compute_confidence(mem_type: str, source: str, content_length: int) -> float:
+    """Compute initial confidence score for a new memory.
+    
+    Factors:
+    - Memory type (procedural/rule → higher)
+    - Source trustworthiness
+    - Content length (very short = less reliable)
+    """
+    base = TYPE_CONFIDENCE.get(mem_type, 0.80)
+    base += SOURCE_CONFIDENCE_BONUS.get(source, 0.0)
+    # Length bonus: 50+ chars → full trust, shorter → scaled down
+    if content_length < 20:
+        base -= 0.15
+    elif content_length < 50:
+        base -= 0.05
+    # Clip to [0.3, 1.0]
+    return max(0.3, min(1.0, base))
+
 
 
 def compute_checksum(content: str) -> str:
@@ -690,10 +760,10 @@ def _compute_embedding(content: str) -> bytes | None:
 def _hybrid_search(db: sqlite3.Connection, query: str, query_embedding: bytes | None,
                    fts_results: list[sqlite3.Row], limit: int,
                    semantic_weight: float = 0.4) -> list[dict]:
-    """Merge FTS5 results with semantic similarity scores.
+    """Merge FTS5 results with semantic similarity using RRF fusion.
 
     If query_embedding is None (no embedding model), returns FTS results as-is.
-    semantic_weight: 0.0 = pure FTS, 1.0 = pure semantic
+    Incorporates confidence as a final weighting factor.
     """
     if query_embedding is None or not fts_results:
         return [row_to_dict(r) for r in fts_results]
@@ -702,27 +772,41 @@ def _hybrid_search(db: sqlite3.Connection, query: str, query_embedding: bytes | 
     if query_vec is None:
         return [row_to_dict(r) for r in fts_results]
 
-    scored = []
-    max_fts_rank = max((abs(r["rank"]) for r in fts_results if r["rank"]), default=1.0)
+    K = 60  # RRF constant
 
-    for r in fts_results:
-        d = row_to_dict(r)
-        # FTS score (normalized, inverted: lower rank = better)
-        fts_score = 1.0 - (abs(r["rank"]) / max_fts_rank) if max_fts_rank > 0 else 0.5
-
-        # Semantic score from stored embedding
-        mem_vec = _blob_to_vector(r["embedding"]) if "embedding" in r.keys() else None
+    # Compute semantic scores for all results
+    sem_scores = {}
+    for i, r in enumerate(fts_results):
+        mem_vec = _blob_to_vector(r["embedding"]) if r["embedding"] else None
         if mem_vec:
-            sem_score = _cosine_similarity(query_vec, mem_vec)
-        else:
-            sem_score = 0.0
+            sem_scores[i] = _cosine_similarity(query_vec, mem_vec)
 
-        # Hybrid score
-        hybrid_score = (1 - semantic_weight) * fts_score + semantic_weight * sem_score
-        d["_fts_score"] = round(fts_score, 3)
-        d["_sem_score"] = round(sem_score, 3)
-        d["_hybrid_score"] = round(hybrid_score, 3)
-        scored.append((hybrid_score, d))
+    # RRF: combine FTS rank and semantic rank
+    scored = []
+    for i, r in enumerate(fts_results):
+        d = row_to_dict(r)
+
+        fts_rank = i + 1  # 1-indexed FTS rank
+
+        # Semantic rank: position by descending semantic score
+        mem_vec = _blob_to_vector(r["embedding"]) if r["embedding"] else None
+        if mem_vec and sem_scores:
+            my_sem = sem_scores.get(i, 0.0)
+            sem_rank = sum(1 for s in sem_scores.values() if s > my_sem) + 1
+        else:
+            sem_rank = fts_rank  # no semantic → same as FTS
+
+        # RRF score = sum of reciprocal ranks
+        rrf_score = (1.0 / (K + fts_rank)) + (1.0 / (K + sem_rank))
+
+        # Confidence weighting: high-confidence memories rank higher
+        confidence = d.get("confidence", 0.8)
+        rrf_score *= confidence
+
+        d["_rrf_score"] = round(rrf_score, 5)
+        d["_fts_rank"] = fts_rank
+        d["_sem_rank"] = sem_rank
+        scored.append((rrf_score, d))
 
     scored.sort(key=lambda x: x[0], reverse=True)
     return [d for _, d in scored[:limit]]
@@ -730,11 +814,12 @@ def _hybrid_search(db: sqlite3.Connection, query: str, query_embedding: bytes | 
 
 # ── Memory Decay & Auto-Cleanup ──────────────────────────
 
-# Default TTLs per priority
+# Default TTLs per priority/memory-type
 DEFAULT_TTL = {
-    "P0": 0,     # never expire
-    "P1": 180,   # 6 months
-    "P2": 60,    # 2 months
+    "P0": 0,           # never expire
+    "procedural": 0,   # SOPs, workflows → never expire (same as P0)
+    "P1": 180,         # 6 months
+    "P2": 60,          # 2 months
 }
 
 # Minimum recall count to resist decay
@@ -742,24 +827,55 @@ DECAY_THRESHOLD = 2
 
 
 def _apply_decay(db: sqlite3.Connection) -> dict:
-    """Apply memory decay: archive expired P2 memories, decay unused ones.
+    """Apply memory decay using Ebbinghaus forgetting curve.
+
+    Memory strength = confidence * 0.5^(days_since_recall / half_life)
+    where half_life increases with recall_count (spacing effect).
+    Archives memories when strength drops below threshold.
 
     Returns stats about what was done.
     """
     now = now_iso()
     stats = {"archived": 0, "decayed": 0}
 
-    # 1. Archive memories past their TTL
-    for priority, ttl_days in DEFAULT_TTL.items():
-        if ttl_days <= 0:
+    # Batch: get all non-exempt memories
+    rows = db.execute(
+        """SELECT id, priority, type, created_at, last_recalled, recall_count, confidence
+           FROM memories
+           WHERE archived=0 AND priority != 'P0' AND type != 'procedural'"""
+    ).fetchall()
+
+    to_archive = []
+    for r in rows:
+        priority = r["priority"]
+        recall_count = r["recall_count"]
+        confidence = r["confidence"]
+
+        # Ebbinghaus half-life: P1 starts at 30d, P2 at 14d, each recall doubles
+        half_life = 30 if priority == "P1" else 14
+        half_life *= (recall_count + 1)
+
+        # Days since last recall (or creation if never recalled)
+        last_time = r["last_recalled"] or r["created_at"]
+        try:
+            last_dt = datetime.fromisoformat(last_time)
+            days_since = (datetime.now(timezone.utc) - last_dt).total_seconds() / 86400.0
+        except (ValueError, TypeError):
             continue
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=ttl_days)).isoformat()
-        result = db.execute(
-            """UPDATE memories SET archived=1, updated_at=?
-               WHERE priority=? AND created_at < ? AND archived=0 AND recall_count < ?""",
-            (now, priority, cutoff, DECAY_THRESHOLD),
+
+        # Exponential decay: strength decays as half-life passes
+        strength = confidence * (0.5 ** (days_since / half_life))
+
+        if strength < 0.05:  # archival threshold
+            to_archive.append(r["id"])
+
+    if to_archive:
+        placeholders = ",".join("?" for _ in to_archive)
+        db.execute(
+            f"UPDATE memories SET archived=1, updated_at=? WHERE id IN ({placeholders})",
+            [now] + to_archive,
         )
-        stats["archived"] += result.rowcount
+        stats["archived"] = len(to_archive)
 
     # 2. Demote hot_tier for memories not recalled recently
     three_months_ago = (datetime.now(timezone.utc) - timedelta(days=90)).isoformat()
@@ -772,7 +888,7 @@ def _apply_decay(db: sqlite3.Connection) -> dict:
     stats["decayed"] = result.rowcount
 
     if stats["archived"] > 0:
-        log.info(f"Decay: archived {stats['archived']} expired memories")
+        log.info(f"Ebbinghaus decay: archived {stats['archived']} memories (strength < 0.05)")
     if stats["decayed"] > 0:
         log.info(f"Decay: demoted {stats['decayed']} cold memories from hot tier")
 
@@ -1584,11 +1700,13 @@ async def root():
 async def save_memory(req: SaveRequest) -> dict:
     memory_id = req.id or str(uuid.uuid4())
     now = now_iso()
-    checksum = compute_checksum(req.content)
-    simhash = compute_simhash(req.content)
-    mem_type = req.type or detect_type(req.content)
+    content = _filter_sensitive(req.content.strip())
+    checksum = compute_checksum(content)
+    simhash = compute_simhash(content)
+    mem_type = req.type or detect_type(content)
     tags_json = json.dumps(req.tags or [])
     category_id = req.category_id or "general"
+    confidence = _compute_confidence(mem_type, req.source or "unknown", len(content))
 
     with db_conn() as db:
         # Check duplicate
@@ -1616,28 +1734,30 @@ async def save_memory(req: SaveRequest) -> dict:
             }
 
         # Compute embedding (non-blocking, optional)
-        embedding_blob = _compute_embedding(req.content.strip())
+        embedding_blob = _compute_embedding(content)
         # Initialize vector clock
         init_clock = json.dumps({req.source: now})
+
+        is_procedural = mem_type == "procedural"
 
         db.execute(
            """INSERT INTO memories
               (id, content, type, scope, source, priority, confidence, tags, category_id,
                 embedding, hot_tier, ttl_days, vector_clock,
                 created_at, updated_at, recall_count, archived, checksum, simhash)
-              VALUES (?, ?, ?, ?, ?, ?, 0.8, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?)""",
-           (memory_id, req.content.strip(), mem_type, req.scope,
-            req.source, req.priority or "P1", tags_json, category_id,
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?)""",
+           (memory_id, content, mem_type, req.scope,
+            req.source, req.priority or "P1", confidence, tags_json, category_id,
             embedding_blob,
-            1 if (req.priority or "P1") == "P0" else 0,  # P0 → hot immediately
-            DEFAULT_TTL.get(req.priority or "P1", 0),
+            1 if (req.priority or "P1") == "P0" or is_procedural else 0,  # procedural → hot immediately
+            DEFAULT_TTL.get(mem_type) or DEFAULT_TTL.get(req.priority or "P1", 0),
             init_clock,
             now, now, checksum, simhash),
         )
 
         # 创建初始版本快照
         VersionManager.create_version(
-            db, memory_id, req.content.strip(),
+            db, memory_id, content,
             change_type="create",
             changed_by=req.source,
             change_reason="Initial memory creation",
@@ -1652,7 +1772,7 @@ async def save_memory(req: SaveRequest) -> dict:
 
         db.execute(
             "INSERT INTO change_log (memory_id, action, snapshot, timestamp) VALUES (?, 'save', ?, ?)",
-            (memory_id, req.content.strip(), now),
+            (memory_id, content, now),
         )
 
     return {"success": True, "action": "saved", "id": memory_id, "type": mem_type}
@@ -1844,7 +1964,8 @@ async def search_memory(req: SearchRequest) -> dict:
         if ids:
             placeholders = ",".join("?" for _ in ids)
             db.execute(
-                f"UPDATE memories SET last_recalled=?, recall_count=recall_count+1 WHERE id IN ({placeholders})",
+                f"UPDATE memories SET last_recalled=?, recall_count=recall_count+1, "
+                f"confidence=MIN(1.0, confidence + 0.02) WHERE id IN ({placeholders})",
                 [now] + ids,
             )
             # Promote to hot tier
@@ -2075,7 +2196,8 @@ async def search_hybrid(req: SearchHybridRequest) -> dict:
             now = now_iso()
             placeholders = ",".join("?" for _ in ids)
             db.execute(
-                f"UPDATE memories SET last_recalled=?, recall_count=recall_count+1 WHERE id IN ({placeholders})",
+                f"UPDATE memories SET last_recalled=?, recall_count=recall_count+1, "
+                f"confidence=MIN(1.0, confidence + 0.02) WHERE id IN ({placeholders})",
                 [now] + ids,
             )
             _sync_hot_tier_from_cache(db)
