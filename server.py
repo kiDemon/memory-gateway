@@ -74,7 +74,7 @@ def init_db(db: sqlite3.Connection) -> None:
         for col_name, col_default in [
             ("hot_tier", "0"),
             ("ttl_days", "0"),
-            ("vector_clock", "'{}'"),
+            ("vector_clock", ""),  # empty string; code reads with `or "{}"` for JSON parsing
         ]:
             if col_name not in columns:
                 log.info(f"Migrating: adding {col_name} column to memories")
