@@ -81,6 +81,36 @@ def init_db(db: sqlite3.Connection) -> None:
                 db.execute(f"ALTER TABLE memories ADD COLUMN {col_name} TEXT DEFAULT '{col_default}'")
                 db.commit()
 
+    # Schema migration: rebuild memory_relations without FK constraints
+    # (source_id/target_id are knowledge graph terms, not memory UUIDs)
+    try:
+        rel_sql = db.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='memory_relations'"
+        ).fetchone()
+        if rel_sql and 'REFERENCES memories' in (rel_sql[0] or ''):
+            log.info("Migrating: rebuilding memory_relations without FK constraints")
+            db.executescript("""
+                CREATE TABLE memory_relations_new (
+                    source_id TEXT NOT NULL,
+                    target_id TEXT NOT NULL,
+                    relation  TEXT NOT NULL DEFAULT 'related_to',
+                    strength  REAL DEFAULT 1.0,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    PRIMARY KEY (source_id, target_id)
+                );
+                INSERT OR IGNORE INTO memory_relations_new
+                    SELECT source_id, target_id, relation, strength, created_at
+                    FROM memory_relations;
+                DROP TABLE memory_relations;
+                ALTER TABLE memory_relations_new RENAME TO memory_relations;
+                CREATE INDEX IF NOT EXISTS idx_relations_source ON memory_relations(source_id);
+                CREATE INDEX IF NOT EXISTS idx_relations_target ON memory_relations(target_id);
+            """)
+            db.commit()
+            log.info("Migration complete: memory_relations FK constraints removed")
+    except Exception as e:
+        log.warning(f"memory_relations migration skipped: {e}")
+
     # Schema migration: rebuild FTS5 if old schema (no category_id)
     try:
         fts_info = db.execute("SELECT sql FROM sqlite_master WHERE name='memories_fts'").fetchone()
@@ -181,8 +211,8 @@ def init_db(db: sqlite3.Connection) -> None:
 
     -- 记忆关联
     CREATE TABLE IF NOT EXISTS memory_relations (
-        source_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
-        target_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+        source_id TEXT NOT NULL,
+        target_id TEXT NOT NULL,
         relation  TEXT NOT NULL DEFAULT 'related_to',
         strength  REAL DEFAULT 1.0,
         created_at TEXT NOT NULL DEFAULT (datetime('now')),
