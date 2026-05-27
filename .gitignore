@@ -17,3 +17,7 @@ __pycache__/
 .vscode/
 *.swp
 *.swo
+
+# OS
+.DS_Store
+Thumbs.db
