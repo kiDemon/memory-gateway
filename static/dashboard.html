@@ -459,36 +459,85 @@ async function loadGraph() {
   if (memoryId) url += '&memory_id=' + encodeURIComponent(memoryId);
   const d = await fetchJSON(url);
   const div = document.getElementById('graphResult');
-  if (!d.nodes || d.nodes.length === 0) {
-    div.innerHTML = '<div class="loading">未找到相关节点</div>';
+
+  // Handle different response formats from backend
+  if (d.error) {
+    div.innerHTML = `<div style="color:var(--red)">错误: ${escapeHtml(typeof d.error === 'string' ? d.error : JSON.stringify(d.error))}</div>`;
     return;
   }
-  div.innerHTML = `<div style="margin-bottom:8px;color:var(--text2);font-size:12px;">节点: ${d.nodes.length} | 边: ${(d.edges||[]).length}</div>
-    <table><tr><th>ID</th><th>标签</th><th>类型</th><th>权重</th></tr>
-    ${d.nodes.map(n => `<tr><td>${escapeHtml((n.id||'').slice(0,16))}</td><td>${escapeHtml(n.label||n.name||'')}</td><td>${escapeHtml(n.type||'')}</td><td>${n.weight||n.score||'-'}</td></tr>`).join('')}
-    </table>`;
+
+  // Term query: returns {term, related, count}
+  if (d.term && d.related) {
+    if (d.related.length === 0) {
+      div.innerHTML = '<div class="loading">未找到与 "' + escapeHtml(d.term) + '" 相关的节点</div>';
+      return;
+    }
+    div.innerHTML = `<div style="margin-bottom:8px;color:var(--text2);font-size:12px;">词条: ${escapeHtml(d.term)} | 关联: ${d.count || d.related.length}</div>
+      <table><tr><th>关联词条</th><th>关系</th><th>强度</th></tr>
+      ${d.related.map(r => `<tr><td>${escapeHtml(r.related||'')}</td><td>${escapeHtml(r.relation||'')}</td><td>${(r.strength||0).toFixed(1)}</td></tr>`).join('')}
+      </table>`;
+    return;
+  }
+
+  // Memory query: returns {memory_id, terms, graph}
+  if (d.terms && d.graph) {
+    const entries = Object.entries(d.graph);
+    if (entries.length === 0) {
+      div.innerHTML = '<div class="loading">该记忆暂无知识图谱数据（关键词<2个）</div>';
+      return;
+    }
+    div.innerHTML = `<div style="margin-bottom:8px;color:var(--text2);font-size:12px;">关键词: ${d.terms.join(', ')} | 关联组: ${entries.length}</div>
+      <table><tr><th>关键词</th><th>关联词条</th><th>关系</th><th>强度</th></tr>
+      ${entries.flatMap(([src, rels]) => rels.map(r => `<tr><td>${escapeHtml(src)}</td><td>${escapeHtml(r.related||'')}</td><td>${escapeHtml(r.relation||'')}</td><td>${(r.strength||0).toFixed(1)}</td></tr>`)).join('')}
+      </table>`;
+    return;
+  }
+
+  // Default: returns {edges, count}
+  if (d.edges && d.edges.length > 0) {
+    div.innerHTML = `<div style="margin-bottom:8px;color:var(--text2);font-size:12px;">边: ${d.count || d.edges.length}</div>
+      <table><tr><th>源</th><th>目标</th><th>关系</th><th>强度</th></tr>
+      ${d.edges.map(e => `<tr><td>${escapeHtml(e.source_id||'')}</td><td>${escapeHtml(e.target_id||'')}</td><td>${escapeHtml(e.relation||'')}</td><td>${(e.strength||0).toFixed(1)}</td></tr>`).join('')}
+      </table>`;
+    return;
+  }
+
+  div.innerHTML = '<div class="loading">知识图谱为空，保存记忆后自动抽取关键词关系</div>';
 }
 
 async function runDreams(action) {
   const div = document.getElementById('dreamsResult');
   div.innerHTML = '<div class="loading">⏳ 梦境处理中...</div>';
-  const d = await fetchPost('/mcp', { tool: 'mem_dreams', action });
+  const d = await fetchPost('/mcp', {
+    jsonrpc: "2.0", id: 1, method: "tools/call",
+    params: { name: "mem_dreams", arguments: { action } }
+  });
   if (d.error) {
-    div.innerHTML = `<div style="color:var(--red)">错误: ${escapeHtml(d.error)}</div>`;
+    div.innerHTML = `<div style="color:var(--red)">错误: ${escapeHtml(typeof d.error === 'string' ? d.error : JSON.stringify(d.error))}</div>`;
     return;
   }
-  div.innerHTML = `<pre style="white-space:pre-wrap;font-size:13px;background:var(--bg);padding:12px;border-radius:6px;max-height:400px;overflow-y:auto;">${escapeHtml(JSON.stringify(d, null, 2))}</pre>`;
+  // MCP returns {result: {content: [{type:"text", text:"..."}]}}
+  const text = d.result?.content?.[0]?.text || JSON.stringify(d, null, 2);
+  let parsed;
+  try { parsed = JSON.parse(text); } catch(e) { parsed = text; }
+  div.innerHTML = `<pre style="white-space:pre-wrap;font-size:13px;background:var(--bg);padding:12px;border-radius:6px;max-height:400px;overflow-y:auto;">${escapeHtml(typeof parsed === 'object' ? JSON.stringify(parsed, null, 2) : String(parsed))}</pre>`;
 }
 
 async function runEvolve(action) {
   const div = document.getElementById('evolveResult');
   div.innerHTML = '<div class="loading">⏳ 自我进化分析中...</div>';
-  const d = await fetchPost('/mcp', { tool: 'mem_evolve', action });
+  const d = await fetchPost('/mcp', {
+    jsonrpc: "2.0", id: 1, method: "tools/call",
+    params: { name: "mem_evolve", arguments: { action } }
+  });
   if (d.error) {
-    div.innerHTML = `<div style="color:var(--red)">错误: ${escapeHtml(d.error)}</div>`;
+    div.innerHTML = `<div style="color:var(--red)">错误: ${escapeHtml(typeof d.error === 'string' ? d.error : JSON.stringify(d.error))}</div>`;
     return;
   }
-  div.innerHTML = `<pre style="white-space:pre-wrap;font-size:13px;background:var(--bg);padding:12px;border-radius:6px;max-height:400px;overflow-y:auto;">${escapeHtml(JSON.stringify(d, null, 2))}</pre>`;
+  const text = d.result?.content?.[0]?.text || JSON.stringify(d, null, 2);
+  let parsed;
+  try { parsed = JSON.parse(text); } catch(e) { parsed = text; }
+  div.innerHTML = `<pre style="white-space:pre-wrap;font-size:13px;background:var(--bg);padding:12px;border-radius:6px;max-height:400px;overflow-y:auto;">${escapeHtml(typeof parsed === 'object' ? JSON.stringify(parsed, null, 2) : String(parsed))}</pre>`;
 }
 
 function loadTools() {
