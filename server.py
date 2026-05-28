@@ -1586,7 +1586,7 @@ class VersionManager:
 
 class SaveRequest(BaseModel):
     content: str = Field(..., max_length=100000)
-    type: Optional[str] = Field(default=None, pattern=r"^(general|rule|preference|decision|context|learning|reference|convention|procedural)$")
+    type: Optional[str] = Field(default=None, pattern=r"^(general|rule|preference|decision|context|learning|reference|convention|procedural|insight)$")
     scope: Optional[str] = Field(default="global", pattern=r"^(global|project|agent)$")
     source: Optional[str] = Field(default="unknown", pattern=r"^(hermes|claude|workbuddy|system|unknown)$")
     priority: Optional[str] = Field(default="P1", pattern=r"^(P0|P1|P2)$")
@@ -1594,6 +1594,8 @@ class SaveRequest(BaseModel):
     tags: Optional[list[str]] = None
     session_id: Optional[str] = None
     id: Optional[str] = None
+    derived_from: Optional[list[str]] = Field(default=None, description="来源记忆ID列表（进化产物血缘）")
+    superseded_by: Optional[str] = Field(default=None, description="被哪条记忆取代（指向新记忆ID）")
 
 
 class UpdateRequest(BaseModel):
@@ -2052,20 +2054,23 @@ async def save_memory(req: SaveRequest) -> dict:
         init_clock = json.dumps({req.source: now})
 
         is_procedural = mem_type == "procedural"
+        derived_from_json = json.dumps(req.derived_from) if req.derived_from else None
 
         db.execute(
            """INSERT INTO memories
               (id, content, type, scope, source, priority, confidence, tags, category_id,
                 embedding, hot_tier, ttl_days, vector_clock,
-                created_at, updated_at, recall_count, archived, checksum, simhash)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?)""",
+                created_at, updated_at, recall_count, archived, checksum, simhash,
+                derived_from, superseded_by)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?)""",
            (memory_id, content, mem_type, req.scope,
             req.source, req.priority or "P1", confidence, tags_json, category_id,
             embedding_blob,
             1 if (req.priority or "P1") == "P0" or is_procedural else 0,  # procedural → hot immediately
             DEFAULT_TTL.get(mem_type) or DEFAULT_TTL.get(req.priority or "P1", 0),
             init_clock,
-            now, now, checksum, simhash),
+            now, now, checksum, simhash,
+            derived_from_json, req.superseded_by),
         )
 
         # 创建初始版本快照
@@ -3023,18 +3028,20 @@ async def stats() -> dict:
 MCP_TOOLS = [
     {
         "name": "mem_save",
-        "description": "保存一条记忆到记忆库。支持分类、优先级、标签等元数据。",
+        "description": "保存一条记忆到记忆库。支持分类、优先级、标签等元数据。支持血缘追踪(derived_from)和替代关系(superseded_by)。",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "content": {"type": "string", "description": "记忆内容"},
                 "category_id": {"type": "string", "description": "分类ID (learning/life/work/innovation/general 或 work_* 子分类)", "default": "general"},
-                "type": {"type": "string", "enum": ["general", "rule", "preference", "decision", "context", "learning", "reference", "convention"], "default": "general"},
+                "type": {"type": "string", "enum": ["general", "rule", "preference", "decision", "context", "learning", "reference", "convention", "insight"], "default": "general"},
                 "priority": {"type": "string", "enum": ["P0", "P1", "P2"], "default": "P1"},
                 "tags": {"type": "array", "items": {"type": "string"}, "description": "自定义标签"},
                 "source": {"type": "string", "enum": ["hermes", "claude", "workbuddy", "system", "unknown"], "default": "unknown"},
                 "scope": {"type": "string", "enum": ["global", "project", "agent"], "default": "global"},
-                "session_id": {"type": "string", "description": "会话ID（可选）"}
+                "session_id": {"type": "string", "description": "会话ID（可选）"},
+                "derived_from": {"type": "array", "items": {"type": "string"}, "description": "来源记忆ID列表（进化产物血缘追踪）"},
+                "superseded_by": {"type": "string", "description": "被哪条记忆取代（指向新记忆ID）"}
             },
             "required": ["content"]
         }
