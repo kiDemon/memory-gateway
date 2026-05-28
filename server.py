@@ -1920,7 +1920,7 @@ async def security_headers_middleware(request: Request, call_next):
     resp.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
     resp.headers.setdefault(
         "Content-Security-Policy",
-        "default-src 'self'; script-src 'self' cdn.jsdelivr.net; style-src 'self' 'unsafe-inline'"
+        "default-src 'self'; script-src 'self' 'unsafe-inline' cdn.jsdelivr.net; connect-src 'self' cdn.jsdelivr.net; style-src 'self' 'unsafe-inline'"
     )
     return resp
 
