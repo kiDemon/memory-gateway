@@ -4070,14 +4070,15 @@ async def admin_login(body: LoginRequest, request: Request):
                 (ip, ua),
             )
         log.info("Successful login from %s", ip)
+        is_https = request.url.scheme == "https"
         resp = JSONResponse({"success": True})
         resp.set_cookie(
             key=COOKIE_NAME,
             value=token,
             max_age=SESSION_DURATION,
             httponly=True,
-            secure=True,
-            samesite="strict",
+            secure=is_https,
+            samesite="strict" if is_https else "lax",
             path="/",
         )
         return resp
