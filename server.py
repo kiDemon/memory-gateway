@@ -114,6 +114,17 @@ def init_db(db: sqlite3.Connection) -> None:
     except Exception as e:
         log.warning(f"memory_relations migration skipped: {e}")
 
+    # Schema migration: add derived_from and superseded_by for self-evolution
+    if columns:
+        for col_name, col_type, col_default in [
+            ("derived_from", "TEXT", "NULL"),
+            ("superseded_by", "TEXT", "NULL"),
+        ]:
+            if col_name not in columns:
+                log.info(f"Migrating: adding {col_name} column to memories")
+                db.execute(f"ALTER TABLE memories ADD COLUMN {col_name} {col_type} DEFAULT {col_default}")
+                db.commit()
+
     # Schema migration: rebuild FTS5 if old schema (no category_id)
     try:
         fts_info = db.execute("SELECT sql FROM sqlite_master WHERE name='memories_fts'").fetchone()
