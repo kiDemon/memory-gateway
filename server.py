@@ -7,11 +7,13 @@ MCP Memory Server — Hermes + Claude Code + WorkBuddy 统一记忆系统
 """
 
 import hashlib
+import hmac
 import json
 import logging
 import os
 import difflib
 import re
+import secrets
 import sqlite3
 import sys
 import time
@@ -24,6 +26,7 @@ from typing import Any, Optional
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 # ── Logging ──────────────────────────────────────────────
@@ -451,6 +454,21 @@ def init_db(db: sqlite3.Connection) -> None:
             log.info(f"Version tracking active: {version_count} versions for {memory_count} memories")
     except Exception as e:
         log.warning(f"Version migration failed (non-fatal): {e}")
+
+    # Schema: login attempts table
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS login_attempts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ip_address TEXT NOT NULL,
+            success INTEGER NOT NULL DEFAULT 0,
+            attempted_at TEXT NOT NULL DEFAULT (datetime('now')),
+            user_agent TEXT DEFAULT ''
+        )
+    """)
+    db.execute("""
+        CREATE INDEX IF NOT EXISTS idx_login_attempts_ip
+        ON login_attempts(ip_address, attempted_at)
+    """)
 
 
 def get_db() -> sqlite3.Connection:
@@ -1652,11 +1670,37 @@ app = FastAPI(
     description="MCP Memory Server — Hermes + Claude Code + WorkBuddy",
 )
 
+# ── CORS Middleware ──────────────────────────────────────
+
+# Dynamically build allowed origins from env or sensible defaults.
+# Wildcard origins are NOT compatible with credentials (cookies), so we
+# enumerate specific origins when credentials are needed.
+_ALLOWED_ORIGINS = os.environ.get("MEMORY_ALLOWED_ORIGINS", "")
+if _ALLOWED_ORIGINS:
+    origins = [o.strip() for o in _ALLOWED_ORIGINS.split(",") if o.strip()]
+else:
+    # Safe default: localhost + container network origins
+    origins = [
+        "http://localhost:3000",
+        "http://localhost:8093",
+        "http://127.0.0.1:3000",
+        "http://127.0.0.1:8093",
+        "http://localhost:8080",
+        "http://127.0.0.1:8080",
+    ]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization", "X-API-Key", "X-CSRF-Token"],
+)
+
 # ── API Key Auth ────────────────────────────────────────
 
 def _generate_api_key() -> str:
     """Generate a cryptographically secure random API key."""
-    import secrets
     return "sk-mg-" + secrets.token_urlsafe(36)
 
 def _load_api_key() -> str:
@@ -1690,8 +1734,7 @@ def _load_api_key() -> str:
     except Exception:
         pass
     log.warning("=" * 64)
-    log.warning("  FIRST RUN — Auto-generated API Key:")
-    log.warning("  %s", new_key)
+    log.warning("  FIRST RUN — Auto-generated API Key (masked): %s...%s", new_key[:8], new_key[-4:])
     log.warning("  Saved to: %s", KEY_FILE)
     log.warning("  Check `docker logs memory-gateway` to retrieve it.")
     log.warning("=" * 64)
@@ -1700,6 +1743,64 @@ def _load_api_key() -> str:
 # ── Runtime API key (loaded at import time) ─────────────
 
 API_KEY = _load_api_key()
+
+# ── Session Token Management ──────────────────────────────
+
+_sessions: dict[str, dict] = {}  # token -> {ip, created_at, expires_at}
+_login_failures: dict[str, list[float]] = {}  # ip -> [timestamps]
+_locked_ips: dict[str, float] = {}  # ip -> unlock_time
+MAX_LOGIN_FAILURES = 5
+LOCKOUT_DURATION = 1800  # 30 minutes
+SESSION_DURATION = 86400 * 7  # 7 days
+
+
+def _create_session(ip: str) -> str:
+    token = secrets.token_urlsafe(32)
+    _sessions[token] = {
+        'ip': ip,
+        'created_at': time.time(),
+        'expires_at': time.time() + SESSION_DURATION,
+    }
+    return token
+
+
+def _validate_session(token: str) -> bool:
+    if token not in _sessions:
+        return False
+    if time.time() > _sessions[token]['expires_at']:
+        del _sessions[token]
+        return False
+    return True
+
+
+def _is_ip_locked(ip: str) -> bool:
+    if ip in _locked_ips:
+        unlock_time = _locked_ips[ip]
+        if time.time() >= unlock_time:
+            del _locked_ips[ip]
+            return False
+        return True
+    return False
+
+
+def _record_failure(ip: str) -> bool:
+    now = time.time()
+    if ip not in _login_failures:
+        _login_failures[ip] = []
+    # Keep only failures within the lockout window
+    cutoff = now - LOCKOUT_DURATION
+    _login_failures[ip] = [t for t in _login_failures[ip] if t > cutoff]
+    _login_failures[ip].append(now)
+    if len(_login_failures[ip]) >= MAX_LOGIN_FAILURES:
+        _locked_ips[ip] = now + LOCKOUT_DURATION
+        log.warning("IP %s locked out for %d seconds (failed %d times)", ip, LOCKOUT_DURATION, len(_login_failures[ip]))
+        return True  # just locked
+    return False
+
+
+def _clear_failures(ip: str) -> None:
+    _login_failures.pop(ip, None)
+    _locked_ips.pop(ip, None)
 
 
 # ── Cookie-based session auth ────────────────────────────
@@ -1783,6 +1884,47 @@ async function login(e) {{
 </body></html>"""
 
 
+# ── CSRF origin check helper ─────────────────────────────
+
+def _is_same_origin(request: Request, url_str: str) -> bool:
+    """Check if a URL/Origin/Referer matches the server's own origin."""
+    if not url_str:
+        return False
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(url_str)
+        # No host means relative URL (same-origin)
+        if not parsed.hostname:
+            return True
+        # Compare hostname and port against the request URL
+        req_parsed = urlparse(str(request.url))
+        if parsed.hostname == req_parsed.hostname and parsed.port == req_parsed.port:
+            return True
+        # Also accept localhost variants
+        if parsed.hostname in ("localhost", "127.0.0.1") and req_parsed.hostname in ("localhost", "127.0.0.1"):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+# ── Security headers middleware ─────────────────────────
+
+@app.middleware("http")
+async def security_headers_middleware(request: Request, call_next):
+    """Add security headers to every response."""
+    resp = await call_next(request)
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("X-Frame-Options", "DENY")
+    resp.headers.setdefault("X-XSS-Protection", "1; mode=block")
+    resp.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    resp.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; script-src 'self' cdn.jsdelivr.net; style-src 'self' 'unsafe-inline'"
+    )
+    return resp
+
+
 @app.middleware("http")
 async def api_key_middleware(request: Request, call_next):
     # Allow health check without auth
@@ -1798,14 +1940,28 @@ async def api_key_middleware(request: Request, call_next):
         return await call_next(request)
 
     if API_KEY:
-        # Check header
+        # Check header (X-API-Key or Authorization: Bearer)
         key = request.headers.get("X-API-Key", "") or request.headers.get("Authorization", "").removeprefix("Bearer ")
         if key == API_KEY:
             return await call_next(request)
 
-        # Check session cookie
-        cookie_key = request.cookies.get(COOKIE_NAME, "")
-        if cookie_key and cookie_key == API_KEY:
+        # Check session cookie (uses token, not raw API Key)
+        cookie_token = request.cookies.get(COOKIE_NAME, "")
+        if cookie_token and _validate_session(cookie_token):
+            # CSRF check: for state-changing requests authenticated via cookie,
+            # require same-origin Referer/Origin to prevent CSRF.
+            if request.method in ("POST", "PUT", "DELETE", "PATCH"):
+                origin = request.headers.get("Origin", "")
+                referer = request.headers.get("Referer", "")
+                # Allow requests with API key header (already checked above)
+                # For cookie-only auth: check origin/referer is same-origin
+                if not _is_same_origin(request, origin or referer):
+                    log.warning("CSRF attempt blocked: %s %s from Origin=%s Referer=%s",
+                                request.method, request.url.path, origin, referer)
+                    return JSONResponse(
+                        status_code=403,
+                        content={"error": "Forbidden", "detail": "CSRF check failed: mismatched origin"},
+                    )
             return await call_next(request)
 
         # Auth failed — return login page for browser, JSON for API
@@ -1841,7 +1997,7 @@ async def startup() -> None:
 async def health() -> dict:
     with db_conn() as db:
         count = db.execute("SELECT COUNT(*) FROM memories WHERE archived=0").fetchone()[0]
-    return {"status": "ok", "version": "5.1.0", "memories": count, "db": str(DB_PATH)}
+    return {"status": "ok", "version": "5.1.0", "memories": count}
 
 
 @app.get("/")
@@ -3885,133 +4041,85 @@ class LoginRequest(BaseModel):
 
 @app.post("/admin/login")
 async def admin_login(body: LoginRequest, request: Request):
-    """Validate API key and set session cookie."""
-    if API_KEY and body.key == API_KEY:
+    """Validate API key and set session cookie with token-based session.
+    Includes login logging, IP-based failure tracking, and lockout."""
+    ip = request.client.host if request.client else "unknown"
+    ua = request.headers.get("User-Agent", "")
+
+    # Check IP lockout
+    if _is_ip_locked(ip):
+        remaining = int(_locked_ips[ip] - time.time())
+        log.warning("Login attempt from locked IP %s (remaining: %ds)", ip, remaining)
+        with db_conn() as db:
+            db.execute(
+                "INSERT INTO login_attempts (ip_address, success, user_agent) VALUES (?, 0, ?)",
+                (ip, ua),
+            )
+        raise HTTPException(
+            status_code=429,
+            detail=f"IP 已被临时锁定，请在 {remaining} 秒后重试",
+        )
+
+    if API_KEY and hmac.compare_digest(body.key, API_KEY):
+        # Successful login
+        _clear_failures(ip)
+        token = _create_session(ip)
+        with db_conn() as db:
+            db.execute(
+                "INSERT INTO login_attempts (ip_address, success, user_agent) VALUES (?, 1, ?)",
+                (ip, ua),
+            )
+        log.info("Successful login from %s", ip)
         resp = JSONResponse({"success": True})
         resp.set_cookie(
             key=COOKIE_NAME,
-            value=API_KEY,
-            max_age=86400 * 30,  # 30 days
+            value=token,
+            max_age=SESSION_DURATION,
             httponly=True,
-            samesite="lax",
+            secure=True,
+            samesite="strict",
             path="/",
         )
         return resp
+
+    # Failed login
+    with db_conn() as db:
+        db.execute(
+            "INSERT INTO login_attempts (ip_address, success, user_agent) VALUES (?, 0, ?)",
+            (ip, ua),
+        )
+    just_locked = _record_failure(ip)
+    if just_locked:
+        log.warning("IP %s locked due to excessive login failures", ip)
+        raise HTTPException(
+            status_code=429,
+            detail=f"登录失败次数过多，IP 已被锁定 {LOCKOUT_DURATION} 秒",
+        )
     raise HTTPException(status_code=401, detail="密钥无效，请检查 API Key 是否正确")
 
 
-@app.get("/admin", response_class=HTMLResponse)
-async def admin_page(request: Request) -> str:
-    """Admin management page for API key operations."""
-    # Mask the key: show first 16 + last 4 chars only
-    masked = API_KEY[:16] + "..." + API_KEY[-4:] if len(API_KEY) > 24 else "****"
-    return f"""<!DOCTYPE html>
-<html lang="zh-CN">
-<head><meta charset="utf-8"><title>Admin — Memory Gateway v4</title>
-<style>
-  body {{ font-family: -apple-system, sans-serif; max-width: 700px; margin: 40px auto; padding: 0 20px; color: #e0e0e0; background: #1a1a2e; }}
-  h1 {{ color: #00d4ff; }}
-  .section {{ margin: 20px 0; padding: 20px; background: #16213e; border-radius: 8px; border-left: 3px solid #00d4ff; }}
-  .section h3 {{ margin-top: 0; color: #00d4ff; }}
-  code {{ background: #0d1117; padding: 3px 8px; border-radius: 4px; font-size: 14px; word-break: break-all; }}
-  .key-display {{ font-family: monospace; background: #0d1117; padding: 10px 16px; border-radius: 6px; word-break: break-all; color: #58a6ff; font-size: 13px; }}
-  button {{ background: #00d4ff; color: #1a1a2e; border: none; padding: 10px 20px; border-radius: 6px; cursor: pointer; font-size: 14px; font-weight: bold; margin-right: 8px; }}
-  button.danger {{ background: #ff4757; color: #fff; }}
-  button:hover {{ opacity: 0.85; }}
-  input {{ background: #0d1117; color: #e0e0e0; border: 1px solid #333; padding: 8px 12px; border-radius: 6px; width: 100%; font-size: 14px; }}
-  .toast {{ position: fixed; top: 20px; right: 20px; padding: 12px 20px; border-radius: 8px; color: #fff; font-weight: bold; display: none; z-index: 999; }}
-  .toast.success {{ background: #2ed573; color: #1a1a2e; }}
-  .toast.error {{ background: #ff4757; }}
-  .nav {{ margin-bottom: 24px; }}
-  .nav a {{ color: #00d4ff; text-decoration: none; margin-right: 20px; padding: 6px 14px; background: #16213e; border-radius: 6px; }}
-  .nav a:hover {{ background: #1f3460; }}
-</style></head>
-<body>
-<div class="nav">
-  <a href="/">Home</a>
-  <a href="/admin" style="background:#1f3460;">Admin</a>
-</div>
-<h1>Admin</h1>
-<div class="section">
-  <h3>Current API Key</h3>
-  <div class="key-display" id="keyDisplay">{masked}</div>
-  <p style="color:#888;font-size:13px;margin-top:8px;">The full key is stored in <code>data/.api_key</code> on the server.</p>
-</div>
-<div class="section">
-  <h3>Rotate Key</h3>
-  <p style="color:#aaa;font-size:14px;">Generate a new random key. The old key is <strong>immediately invalidated</strong>. All connected clients must update their config.</p>
-  <button id="rotateBtn" onclick="rotateKey()">Rotate Key</button>
-  <button class="danger" id="resetBtn" onclick="resetKey()">Reset + Regenerate</button>
-</div>
-<div class="section">
-  <h3>Set Custom Key</h3>
-  <p style="color:#aaa;font-size:14px;">Paste your own key (min 16 characters). This replaces the current key immediately.</p>
-  <input type="text" id="customKey" placeholder="sk-mg-your-custom-key-min-16-chars..." style="margin-bottom:10px;">
-  <button onclick="setCustomKey()">Set Custom Key</button>
-</div>
-<div id="toast" class="toast"></div>
-<script>
-const API_KEY_HINT = "{masked}";
-const STORED_KEY = localStorage.getItem('memory_gateway_key');
-function authHeaders() {{
-  const k = STORED_KEY || '';
-  return k ? {{'X-API-Key': k, 'Content-Type': 'application/json'}} : {{}};
-}}
-function showToast(msg, type) {{
-  const t = document.getElementById('toast');
-  t.textContent = msg;
-  t.className = 'toast ' + type;
-  t.style.display = 'block';
-  setTimeout(() => t.style.display = 'none', 4000);
-}}
-async function rotateKey() {{
-  if (!confirm('Rotate the API key? All current clients will be disconnected and must update their config.')) return;
-  try {{
-    const r = await fetch('/admin/apikey/rotate', {{method:'POST', headers: authHeaders()}});
-    const d = await r.json();
-    if (r.ok) {{
-      document.getElementById('keyDisplay').textContent = d.key;
-      showToast('Key rotated! New key shown above.', 'success');
-    }} else {{
-      showToast(d.detail || 'Failed', 'error');
-    }}
-  }} catch(e) {{ showToast('Network error: ' + e.message, 'error'); }}
-}}
-async function resetKey() {{
-  if (!confirm('DELETE the current key and auto-generate a new one? This cannot be undone.')) return;
-  try {{
-    const r = await fetch('/admin/apikey/reset', {{method:'POST', headers: authHeaders()}});
-    const d = await r.json();
-    if (r.ok) {{
-      document.getElementById('keyDisplay').textContent = d.key;
-      showToast('New key generated!', 'success');
-    }} else {{
-      showToast(d.detail || 'Failed', 'error');
-    }}
-  }} catch(e) {{ showToast('Network error: ' + e.message, 'error'); }}
-}}
-async function setCustomKey() {{
-  const newKey = document.getElementById('customKey').value.trim();
-  if (newKey.length < 16) {{ showToast('Key must be at least 16 characters', 'error'); return; }}
-  if (!confirm('Replace the current key with your custom key? All clients will be disconnected.')) return;
-  try {{
-    const r = await fetch('/admin/apikey/set', {{
-      method:'POST',
-      headers: authHeaders(),
-      body: JSON.stringify({{key: newKey}})
-    }});
-    const d = await r.json();
-    if (r.ok) {{
-      document.getElementById('keyDisplay').textContent = d.masked;
-      document.getElementById('customKey').value = '';
-      showToast('Custom key set!', 'success');
-    }} else {{
-      showToast(d.detail || 'Failed', 'error');
-    }}
-  }} catch(e) {{ showToast('Network error: ' + e.message, 'error'); }}
-}}
-</script>
-</body></html>"""
+@app.post("/admin/logout")
+async def admin_logout(request: Request):
+    """Logout: delete session token and clear cookie."""
+    origin = request.headers.get("Origin", "")
+    referer = request.headers.get("Referer", "")
+    if not _is_same_origin(request, origin or referer):
+        raise HTTPException(status_code=403, detail="CSRF check failed")
+    token = request.cookies.get(COOKIE_NAME, "")
+    if token and token in _sessions:
+        del _sessions[token]
+    resp = JSONResponse({"success": True, "message": "已登出"})
+    resp.delete_cookie(
+        key=COOKIE_NAME,
+        path="/",
+    )
+    return resp
+
+
+@app.get("/admin")
+async def admin_page(request: Request):
+    """Redirect to unified dashboard."""
+    return RedirectResponse(url="/dashboard", status_code=302)
 
 
 @app.get("/admin/apikey")
@@ -4028,12 +4136,16 @@ async def get_apikey_info() -> dict:
 
 
 @app.post("/admin/apikey/rotate")
-async def rotate_apikey() -> dict:
+async def rotate_apikey(request: Request) -> dict:
     """Generate a new API key, persist to file, and update runtime.
 
     The old key is immediately invalidated.
     Environment variable key cannot be rotated — set MEMORY_API_KEY to empty first.
     """
+    origin = request.headers.get("Origin", "")
+    referer = request.headers.get("Referer", "")
+    if not _is_same_origin(request, origin or referer):
+        raise HTTPException(status_code=403, detail="CSRF check failed")
     global API_KEY
 
     if os.environ.get("MEMORY_API_KEY", "").strip():
@@ -4050,12 +4162,17 @@ async def rotate_apikey() -> dict:
         pass
     API_KEY = new_key
     log.warning("API Key rotated — new key saved to %s", KEY_FILE)
-    return {"success": True, "key": new_key, "message": "Key rotated. All clients must update."}
+    masked = new_key[:16] + "..." + new_key[-4:] if len(new_key) > 24 else "****"
+    return {"success": True, "masked": masked, "message": "Key rotated. All clients must update."}
 
 
 @app.post("/admin/apikey/reset")
-async def reset_apikey() -> dict:
+async def reset_apikey(request: Request) -> dict:
     """Delete the key file and auto-generate a new key."""
+    origin = request.headers.get("Origin", "")
+    referer = request.headers.get("Referer", "")
+    if not _is_same_origin(request, origin or referer):
+        raise HTTPException(status_code=403, detail="CSRF check failed")
     global API_KEY
 
     if os.environ.get("MEMORY_API_KEY", "").strip():
@@ -4074,16 +4191,17 @@ async def reset_apikey() -> dict:
         pass
     API_KEY = new_key
     log.warning("API Key reset — new key saved to %s", KEY_FILE)
-    return {"success": True, "key": new_key, "message": "Key reset and regenerated."}
-
-
-class SetKeyRequest(BaseModel):
-    key: str = Field(..., min_length=16, max_length=256)
+    masked = new_key[:16] + "..." + new_key[-4:] if len(new_key) > 24 else "****"
+    return {"success": True, "masked": masked, "message": "Key reset and regenerated."}
 
 
 @app.post("/admin/apikey/set")
-async def set_apikey(req: SetKeyRequest) -> dict:
+async def set_apikey(req: SetKeyRequest, request: Request) -> dict:
     """Set a custom API key. Replaces the current key immediately."""
+    origin = request.headers.get("Origin", "")
+    referer = request.headers.get("Referer", "")
+    if not _is_same_origin(request, origin or referer):
+        raise HTTPException(status_code=403, detail="CSRF check failed")
     global API_KEY
 
     if os.environ.get("MEMORY_API_KEY", "").strip():
@@ -4102,6 +4220,126 @@ async def set_apikey(req: SetKeyRequest) -> dict:
     masked = new_key[:16] + "..." + new_key[-4:] if len(new_key) > 24 else "****"
     log.warning("API Key manually set — saved to %s", KEY_FILE)
     return {"success": True, "masked": masked, "message": "Custom key set."}
+
+
+# ── Settings API Routes ──────────────────────────────────
+
+
+@app.get("/api/settings/apikey")
+async def settings_apikey_info() -> dict:
+    """Return current API key info (masked + source)."""
+    masked = API_KEY[:16] + "..." + API_KEY[-4:] if len(API_KEY) > 24 else "****"
+    return {
+        "masked": masked,
+        "length": len(API_KEY),
+        "source": "environment" if os.environ.get("MEMORY_API_KEY", "").strip() else (
+            "file" if KEY_FILE.exists() else "auto-generated"
+        ),
+    }
+
+
+@app.post("/api/settings/apikey/rotate")
+async def settings_apikey_rotate(request: Request) -> dict:
+    """Generate a new API key, persist to file, and update runtime."""
+    origin = request.headers.get("Origin", "")
+    referer = request.headers.get("Referer", "")
+    if not _is_same_origin(request, origin or referer):
+        raise HTTPException(status_code=403, detail="CSRF check failed")
+    global API_KEY
+
+    if os.environ.get("MEMORY_API_KEY", "").strip():
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot rotate key set via MEMORY_API_KEY env var."
+        )
+
+    new_key = _generate_api_key()
+    KEY_FILE.write_text(new_key)
+    try:
+        os.chmod(KEY_FILE, 0o600)
+    except Exception:
+        pass
+    API_KEY = new_key
+    log.warning("API Key rotated via /api/settings/apikey/rotate — saved to %s", KEY_FILE)
+    masked = new_key[:16] + "..." + new_key[-4:] if len(new_key) > 24 else "****"
+    return {"success": True, "masked": masked, "message": "Key rotated."}
+
+@app.post("/api/settings/apikey/set")
+async def settings_apikey_set(req: SetKeyRequest, request: Request) -> dict:
+    """Set a custom API key."""
+    origin = request.headers.get("Origin", "")
+    referer = request.headers.get("Referer", "")
+    if not _is_same_origin(request, origin or referer):
+        raise HTTPException(status_code=403, detail="CSRF check failed")
+    global API_KEY
+
+    if os.environ.get("MEMORY_API_KEY", "").strip():
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot override key set via MEMORY_API_KEY env var."
+        )
+
+    new_key = req.key.strip()
+    KEY_FILE.write_text(new_key)
+    try:
+        os.chmod(KEY_FILE, 0o600)
+    except Exception:
+        pass
+    API_KEY = new_key
+    masked = new_key[:16] + "..." + new_key[-4:] if len(new_key) > 24 else "****"
+    log.warning("API Key manually set via /api/settings/apikey/set — saved to %s", KEY_FILE)
+    return {"success": True, "masked": masked, "message": "Custom key set."}
+
+
+@app.get("/api/settings/login-logs")
+async def settings_login_logs(limit: int = 50):
+    """Return recent login attempt logs (IPs are masked for privacy)."""
+    with db_conn() as db:
+        rows = db.execute(
+            "SELECT id, ip_address, success, attempted_at, user_agent "
+            "FROM login_attempts ORDER BY attempted_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    logs = []
+    for r in rows:
+        entry = dict(r)
+        ip = entry.get("ip_address", "")
+        # Mask last octet for privacy (IPv4 only)
+        if ip and ":" not in ip:
+            parts = ip.rsplit(".", 1)
+            if len(parts) == 2:
+                entry["ip_address"] = parts[0] + ".xxx"
+        elif ip and ":" in ip:
+            # IPv6: mask last 4 groups
+            parts = ip.rsplit(":", 4)
+            if len(parts) == 5:
+                entry["ip_address"] = parts[0] + ":xxxx:xxxx:xxxx:xxxx"
+        logs.append(entry)
+    return {"logs": logs, "total": len(logs)}
+
+
+@app.get("/api/settings/lockout-status")
+async def settings_lockout_status():
+    """Return currently locked IPs."""
+    now = time.time()
+    locked = {}
+    for ip, unlock_time in list(_locked_ips.items()):
+        if now < unlock_time:
+            # Mask last octet for privacy (same as login-logs)
+            masked_ip = ip
+            if ip and ":" not in ip:
+                parts = ip.rsplit(".", 1)
+                if len(parts) == 2:
+                    masked_ip = parts[0] + ".xxx"
+            elif ip and ":" in ip:
+                parts = ip.rsplit(":", 4)
+                if len(parts) == 5:
+                    masked_ip = parts[0] + ":xxxx:xxxx:xxxx:xxxx"
+            locked[masked_ip] = {
+                "unlock_at": datetime.fromtimestamp(unlock_time, tz=timezone.utc).isoformat(),
+                "remaining_seconds": int(unlock_time - now),
+            }
+    return {"locked_ips": locked, "count": len(locked)}
 
 
 # ── Dashboard ────────────────────────────────────────────

@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Memory Gateway Dashboard</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js" integrity="sha384-e6nUZLBkQ86NJ6TVVKAeSaK8jWa3NhkYWZFomE39AvDbQWeie9PlQqM3pmYW5d1g" crossorigin="anonymous"></script>
 <style>
 :root {
   --bg: #0f1117; --bg2: #161822; --bg3: #1e2030;
@@ -81,6 +81,7 @@ tr:hover { background:var(--bg3); }
   <div style="display:flex;align-items:center;gap:8px;">
     <input type="password" id="apiKeyInput" placeholder="API Key" style="width:130px;font-size:12px;padding:4px 8px;background:var(--bg3);border:1px solid var(--border);color:var(--text);border-radius:4px;">
     <button class="btn" style="padding:4px 10px;font-size:12px;" onclick="const k=document.getElementById('apiKeyInput').value;localStorage.setItem('mg_api_key',k);showToast('API Key saved')">保存</button>
+    <button class="btn" style="padding:4px 10px;font-size:12px;background:var(--danger);color:#fff;" onclick="logoutUser()" title="登出">🚪</button>
   </div>
 </div>
 
@@ -92,6 +93,7 @@ tr:hover { background:var(--bg3); }
   <div class="tab" data-tab="evolution">🧬 进化追踪</div>
   <div class="tab" data-tab="tools">🛠️ 智能工具</div>
   <div class="tab" data-tab="system">⚙️ 系统监控</div>
+  <div class="tab" data-tab="settings">⚙️ 设置</div>
 </div>
 
 <!-- 总览页 -->
@@ -184,6 +186,61 @@ tr:hover { background:var(--bg3); }
   <div class="card" id="versionStats"><h3>🧬 版本控制统计</h3><div class="loading">加载中...</div></div>
 </div>
 
+<!-- 设置 -->
+<div class="content hidden" id="tab-settings">
+  <div class="grid grid-2" style="grid-template-columns:1fr 1fr;">
+    <!-- API Key 管理 -->
+    <div class="card">
+      <h3>🔑 API Key 管理</h3>
+      <div style="margin-top:12px;">
+        <div style="margin-bottom:8px;">
+          <span style="color:var(--text2);font-size:13px;">当前 Key：</span>
+          <span id="currentKeyDisplay" style="color:var(--text);font-family:monospace;font-size:13px;">加载中...</span>
+        </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;">
+          <button class="btn" onclick="rotateApiKey()" style="padding:6px 14px;font-size:13px;">🔄 轮换 Key</button>
+          <button class="btn danger" onclick="resetApiKey()" style="padding:6px 14px;font-size:13px;background:var(--red);color:#fff;">♻️ 重置+生成</button>
+          <button class="btn secondary" onclick="copyApiKey()" style="padding:6px 14px;font-size:13px;">📋 复制 Key</button>
+        </div>
+        <div style="margin-top:12px;display:flex;gap:8px;">
+          <input type="text" id="customApiKeyInput" placeholder="输入自定义 API Key..." style="flex:1;font-size:13px;padding:6px 10px;">
+          <button class="btn" onclick="setCustomApiKey()" style="padding:6px 14px;font-size:13px;">设置</button>
+        </div>
+        <div id="keyResult" style="margin-top:8px;font-size:13px;"></div>
+      </div>
+    </div>
+
+    <!-- 登出 -->
+    <div class="card">
+      <h3>🚪 会话管理</h3>
+      <div style="margin-top:12px;">
+        <p style="color:var(--text2);font-size:13px;margin-bottom:12px;">登出将清除本地存储的 API Key。</p>
+        <button id="logoutButton" class="btn" style="background:var(--danger);color:#fff;padding:8px 24px;font-size:14px;" onclick="logoutUser()">🚪 登出</button>
+      </div>
+    </div>
+  </div>
+
+  <div style="height:16px"></div>
+
+  <!-- 登录日志 -->
+  <div class="card">
+    <h3>📋 登录日志</h3>
+    <div id="loginLogsContainer" style="margin-top:12px;">
+      <div class="loading">加载中...</div>
+    </div>
+  </div>
+
+  <div style="height:16px"></div>
+
+  <!-- 锁定状态 -->
+  <div class="card">
+    <h3>🔒 锁定状态</h3>
+    <div id="lockoutStatusContainer" style="margin-top:12px;">
+      <div class="loading">加载中...</div>
+    </div>
+  </div>
+</div>
+
 <!-- 详情面板 -->
 <div class="detail-panel" id="detailPanel">
   <div class="close" onclick="closeDetail()">✕</div>
@@ -250,6 +307,7 @@ document.querySelectorAll('.tab').forEach(tab => {
     if (tab.dataset.tab === 'memories') searchMemories();
     if (tab.dataset.tab === 'system') loadSystem();
     if (tab.dataset.tab === 'tools') loadTools();
+    if (tab.dataset.tab === 'settings') loadSettings();
   });
 });
 
@@ -556,6 +614,165 @@ async function runEvolve(action) {
 
 function loadTools() {
   loadGraph();
+}
+
+// ═══ 设置 ═══
+async function loadSettings() {
+  // 加载 API Key 信息
+  const keyInfo = await fetchJSON('/api/settings/apikey');
+  const keyDisplay = document.getElementById('currentKeyDisplay');
+  if (keyInfo.masked) {
+    keyDisplay.textContent = keyInfo.masked;
+  } else if (keyInfo.key) {
+    const masked = keyInfo.key.length > 8
+      ? keyInfo.key.slice(0, 4) + '••••' + keyInfo.key.slice(-4)
+      : '••••' + keyInfo.key.slice(-4);
+    keyDisplay.textContent = masked;
+  } else if (keyInfo.api_key) {
+    const masked = keyInfo.api_key.length > 8
+      ? keyInfo.api_key.slice(0, 4) + '••••' + keyInfo.api_key.slice(-4)
+      : '••••' + keyInfo.api_key.slice(-4);
+    keyDisplay.textContent = masked;
+  } else {
+    keyDisplay.textContent = '未设置';
+  }
+  // Do NOT store the full key in dataset.fullKey — security risk
+  keyDisplay.dataset.fullKey = '';
+
+  // 加载登录日志
+  await loadLoginLogs();
+
+  // 加载锁定状态
+  await loadLockoutStatus();
+}
+
+async function loadLoginLogs() {
+  const container = document.getElementById('loginLogsContainer');
+  const d = await fetchJSON('/api/settings/login-logs?limit=50');
+  const logs = d.logs || d.login_logs || [];
+  if (!logs.length) {
+    container.innerHTML = '<div style="color:var(--text2);padding:12px;text-align:center;">暂无登录日志</div>';
+    return;
+  }
+  container.innerHTML = `<table>
+    <tr><th>时间</th><th>IP</th><th>状态</th><th>User-Agent</th></tr>
+    ${logs.map(log => {
+      const status = (log.status || '').toLowerCase();
+      const isSuccess = status === 'success' || status === 'ok' || status === '允许' || status === 'successful';
+      const statusColor = isSuccess ? 'var(--green)' : 'var(--red)';
+      const statusText = isSuccess ? '✅ 成功' : '❌ 失败';
+      return `<tr>
+        <td>${escapeHtml((log.time || log.timestamp || log.created_at || '').slice(0,19))}</td>
+        <td>${escapeHtml(log.ip || log.ip_address || '')}</td>
+        <td style="color:${statusColor};font-weight:600;">${statusText}</td>
+        <td style="font-size:12px;color:var(--text2);max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(log.user_agent || log.ua || '')}</td>
+      </tr>`;
+    }).join('')}
+  </table>`;
+}
+
+async function loadLockoutStatus() {
+  const container = document.getElementById('lockoutStatusContainer');
+  const d = await fetchJSON('/api/settings/lockout-status');
+  const entries = d.locked_ips || d.lockouts || d.entries || [];
+  if (!entries.length) {
+    container.innerHTML = '<div style="color:var(--green);padding:12px;text-align:center;">✅ 当前无被锁定的 IP</div>';
+    return;
+  }
+  container.innerHTML = `<table>
+    <tr><th>IP</th><th>锁定时间</th><th>预计解锁时间</th></tr>
+    ${entries.map(entry => `<tr>
+      <td>${escapeHtml(entry.ip || entry.ip_address || '')}</td>
+      <td>${escapeHtml((entry.locked_at || entry.lock_time || entry.created_at || '').slice(0,19))}</td>
+      <td>${escapeHtml((entry.unlock_at || entry.expires_at || entry.release_at || '') .slice(0,19))}</td>
+    </tr>`).join('')}
+  </table>`;
+}
+
+async function rotateApiKey() {
+  const resultDiv = document.getElementById('keyResult');
+  resultDiv.innerHTML = '<span style="color:var(--text2)">⏳ 轮换中...</span>';
+  const d = await fetchPost('/api/settings/apikey/rotate');
+  if (d.error) {
+    resultDiv.innerHTML = `<span style="color:var(--red)">❌ 轮换失败: ${escapeHtml(d.error)}</span>`;
+    return;
+  }
+  // API now returns masked key only for security; key is saved server-side
+  if (d.masked) {
+    document.getElementById('currentKeyDisplay').textContent = d.masked;
+    resultDiv.innerHTML = '<span style="color:var(--green)">✅ Key 轮换成功（新 Key 已保存在服务器，请刷新页面更新客户端配置）</span>';
+  } else {
+    resultDiv.innerHTML = '<span style="color:var(--green)">✅ Key 轮换成功</span>';
+  }
+}
+
+async function resetApiKey() {
+  const resultDiv = document.getElementById('keyResult');
+  if (!confirm('重置+生成将删除当前 Key 文件并自动生成新 Key。所有已连接的客户端将断开连接。确定继续？')) return;
+  resultDiv.innerHTML = '<span style="color:var(--text2)">⏳ 重置中...</span>';
+  const d = await fetchPost('/admin/apikey/reset');
+  if (d.error) {
+    resultDiv.innerHTML = `<span style="color:var(--red)">❌ 重置失败: ${escapeHtml(d.error)}</span>`;
+    return;
+  }
+  if (d.masked) {
+    document.getElementById('currentKeyDisplay').textContent = d.masked;
+  }
+  resultDiv.innerHTML = '<span style="color:var(--green)">✅ Key 已重置并重新生成。请更新所有客户端配置。</span>';
+}
+
+async function setCustomApiKey() {
+  const input = document.getElementById('customApiKeyInput');
+  const key = input.value.trim();
+  if (!key) {
+    document.getElementById('keyResult').innerHTML = '<span style="color:var(--yellow)">⚠️ 请输入 API Key</span>';
+    return;
+  }
+  const resultDiv = document.getElementById('keyResult');
+  resultDiv.innerHTML = '<span style="color:var(--text2)">⏳ 设置中...</span>';
+  const d = await fetchPost('/api/settings/apikey/set', { key });
+  if (d.error) {
+    resultDiv.innerHTML = `<span style="color:var(--red)">❌ 设置失败: ${escapeHtml(d.error)}</span>`;
+    return;
+  }
+  localStorage.setItem('mg_api_key', key);
+  document.getElementById('apiKeyInput').value = key;
+  if (d.masked) {
+    document.getElementById('currentKeyDisplay').textContent = d.masked;
+  } else {
+    const masked = key.length > 8
+      ? key.slice(0, 4) + '••••' + key.slice(-4)
+      : '••••' + key.slice(-4);
+    document.getElementById('currentKeyDisplay').textContent = masked;
+  }
+  input.value = '';
+  resultDiv.innerHTML = '<span style="color:var(--green)">✅ API Key 设置成功，已自动保存</span>';
+}
+
+function copyApiKey() {
+  // 安全策略：不在前端存储完整 Key，防止 XSS 泄露
+  showToast('⚠️ 出于安全考虑，完整 Key 不在前端显示。请从服务器 data/.api_key 文件获取');
+}
+
+async function logoutUser() {
+  const key = getApiKey();
+  // 同时用 cookie 和 API Key 两种方式调用登出接口
+  try {
+    const headers = { 'Content-Type': 'application/json' };
+    if (key) headers['X-API-Key'] = key;
+    await fetch(API + '/admin/logout', {
+      method: 'POST',
+      headers,
+      credentials: 'same-origin'  // 携带 session cookie
+    });
+  } catch (e) {
+    // 忽略网络错误，仍然清除本地状态
+  }
+  localStorage.removeItem('mg_api_key');
+  sessionStorage.clear();
+  document.cookie = 'memory_gateway_session=; path=/; max-age=0; SameSite=Strict';
+  document.getElementById('apiKeyInput').value = '';
+  window.location.href = '/';
 }
 
 // 初始化分类筛选器
