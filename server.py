@@ -194,7 +194,8 @@ def init_db(db: sqlite3.Connection) -> None:
         recall_count INTEGER NOT NULL DEFAULT 0,
         archived    INTEGER NOT NULL DEFAULT 0,
         checksum    TEXT NOT NULL,
-        simhash     TEXT DEFAULT ''
+        simhash     TEXT DEFAULT '',
+        insights    TEXT DEFAULT ''
     );
 
     CREATE TABLE IF NOT EXISTS session_memories (
@@ -1607,6 +1608,7 @@ class SaveRequest(BaseModel):
     id: Optional[str] = None
     derived_from: Optional[list[str]] = Field(default=None, description="来源记忆ID列表（进化产物血缘）")
     superseded_by: Optional[str] = Field(default=None, description="被哪条记忆取代（指向新记忆ID）")
+    insights: Optional[str] = Field(default=None, max_length=5000, description="提炼结论：从这条记忆学到了什么")
 
 
 class UpdateRequest(BaseModel):
@@ -3308,6 +3310,21 @@ MCP_TOOLS = [
         }
     },
     {
+        "name": "mem_insights_generate",
+        "description": "自我蒸馏：从高频记忆中自动提炼 insights（目标/摩擦点/结论），生成结构化的学习笔记。借鉴 Claude Code 的 facets 模式。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["generate", "list", "update"], "description": "操作类型：generate=从高频记忆生成insights，list=列出已有insights，update=更新指定记忆的insights"},
+                "memory_id": {"type": "string", "description": "指定记忆ID（update操作必填）"},
+                "insights": {"type": "string", "description": "insights内容（update操作必填）"},
+                "min_recall_count": {"type": "integer", "description": "最低召回次数阈值", "default": 3},
+                "limit": {"type": "integer", "description": "最大处理数量", "default": 20}
+            },
+            "required": ["action"]
+        }
+    },
+    {
         "name": "mem_evolve",
         "description": "CSSF自进化协议：分析记忆使用模式，生成元洞察（哪些知识被频繁使用、哪些被遗忘），自动优化记忆优先级。建议每周运行一次。",
         "inputSchema": {
@@ -3684,6 +3701,104 @@ async def handle_mcp_tools_call(request_id: Any, params: dict) -> dict:
 
             text = json.dumps(result, ensure_ascii=False, default=str)
 
+        elif tool_name == "mem_insights_generate":
+            action = arguments.get("action", "generate")
+            memory_id = arguments.get("memory_id")
+            insights_text = arguments.get("insights")
+            min_recall = arguments.get("min_recall_count", 3)
+            limit = arguments.get("limit", 20)
+
+            with db_conn() as db:
+                if action == "generate":
+                    # 从高频记忆中自动生成 insights（自我蒸馏）
+                    rows = db.execute(
+                        "SELECT id, content, type, category_id, recall_count, priority, source "
+                        "FROM memories WHERE archived=0 AND recall_count >= ? AND (insights IS NULL OR insights='') "
+                        "ORDER BY recall_count DESC LIMIT ?",
+                        (min_recall, limit)
+                    ).fetchall()
+
+                    generated = []
+                    for r in rows:
+                        # 简单的 insights 生成逻辑（基于内容特征）
+                        content = r["content"]
+                        insight_parts = []
+
+                        # 提取目标（如果内容包含"目标"、"目的"、"要"等关键词）
+                        if any(kw in content for kw in ["目标", "目的", "要", "需要", "应该"]):
+                            insight_parts.append("目标明确")
+
+                        # 提取摩擦点（如果内容包含"问题"、"困难"、"bug"、"错误"等）
+                        if any(kw in content for kw in ["问题", "困难", "bug", "错误", "失败", "卡住"]):
+                            insight_parts.append("存在摩擦点")
+
+                        # 提取结论（如果内容包含"结论"、"结果"、"发现"、"学到"等）
+                        if any(kw in content for kw in ["结论", "结果", "发现", "学到", "经验", "教训"]):
+                            insight_parts.append("有明确结论")
+
+                        # 如果没有匹配到关键词，生成通用 insight
+                        if not insight_parts:
+                            insight_parts.append(f"高频使用({r['recall_count']}次)")
+
+                        insight = " | ".join(insight_parts)
+                        generated.append({"id": r["id"], "content_preview": content[:100], "insight": insight})
+
+                        # 更新数据库
+                        db.execute(
+                            "UPDATE memories SET insights=? WHERE id=?",
+                            (insight, r["id"])
+                        )
+
+                    result = {
+                        "action": "generate",
+                        "generated_count": len(generated),
+                        "memories": generated,
+                        "message": f"为 {len(generated)} 条高频记忆生成了 insights"
+                    }
+
+                elif action == "list":
+                    # 列出已有 insights 的记忆
+                    rows = db.execute(
+                        "SELECT id, content, insights, recall_count, category_id "
+                        "FROM memories WHERE archived=0 AND insights IS NOT NULL AND insights != '' "
+                        "ORDER BY recall_count DESC LIMIT ?",
+                        (limit,)
+                    ).fetchall()
+
+                    result = {
+                        "action": "list",
+                        "count": len(rows),
+                        "memories": [dict(r) for r in rows]
+                    }
+
+                elif action == "update":
+                    # 更新指定记忆的 insights
+                    if not memory_id or not insights_text:
+                        result = {"error": "memory_id and insights are required for update action"}
+                    else:
+                        existing = db.execute(
+                            "SELECT id FROM memories WHERE id=? AND archived=0",
+                            (memory_id,)
+                        ).fetchone()
+                        if not existing:
+                            result = {"error": f"Memory {memory_id} not found"}
+                        else:
+                            db.execute(
+                                "UPDATE memories SET insights=?, updated_at=? WHERE id=?",
+                                (insights_text, now_iso(), memory_id)
+                            )
+                            result = {
+                                "action": "update",
+                                "success": True,
+                                "memory_id": memory_id,
+                                "insights": insights_text
+                            }
+
+                else:
+                    result = {"error": f"Unknown action: {action}"}
+
+            text = json.dumps(result, ensure_ascii=False, default=str)
+
         elif tool_name == "mem_evolve":
             action = arguments.get("action", "analyze")
             days = arguments.get("days", 30)
@@ -3966,15 +4081,15 @@ async def batch_save(req: BatchSaveRequest) -> dict:
                 """INSERT INTO memories
                    (id, content, type, scope, source, priority, confidence, tags, category_id,
                     embedding, hot_tier, ttl_days, vector_clock,
-                    created_at, updated_at, recall_count, archived, checksum, simhash)
-                   VALUES (?, ?, ?, ?, ?, ?, 0.8, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?)""",
+                    created_at, updated_at, recall_count, archived, checksum, simhash, insights)
+                   VALUES (?, ?, ?, ?, ?, ?, 0.8, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?)""",
                 (memory_id, mem.content.strip(), mem_type, mem.scope,
                  mem.source, mem.priority or "P1", tags_json, category_id,
                  embedding_blob,
                  1 if (mem.priority or "P1") == "P0" else 0,
                  DEFAULT_TTL.get(mem.priority or "P1", 0),
                  init_clock,
-                 now, now, checksum, simhash_val),
+                 now, now, checksum, simhash_val, mem.insights or ""),
             )
 
             if mem.session_id:
