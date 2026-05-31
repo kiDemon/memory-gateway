@@ -194,8 +194,7 @@ def init_db(db: sqlite3.Connection) -> None:
         recall_count INTEGER NOT NULL DEFAULT 0,
         archived    INTEGER NOT NULL DEFAULT 0,
         checksum    TEXT NOT NULL,
-        simhash     TEXT DEFAULT '',
-        insights    TEXT DEFAULT ''
+        simhash     TEXT DEFAULT ''
     );
 
     CREATE TABLE IF NOT EXISTS session_memories (
@@ -387,24 +386,6 @@ def init_db(db: sqlite3.Connection) -> None:
         updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
     );
     CREATE INDEX IF NOT EXISTS idx_personas_type ON personas(persona_type, name);
-
-    CREATE TABLE IF NOT EXISTS skills (
-        id              TEXT PRIMARY KEY,
-        name            TEXT NOT NULL,
-        description     TEXT NOT NULL DEFAULT '',
-        trigger_pattern TEXT NOT NULL DEFAULT '',
-        content_md      TEXT NOT NULL DEFAULT '',
-        category        TEXT NOT NULL DEFAULT 'general',
-        source_memory_ids TEXT NOT NULL DEFAULT '[]',
-        confidence      REAL NOT NULL DEFAULT 0.0,
-        recall_count    INTEGER NOT NULL DEFAULT 0,
-        agent_scope     TEXT NOT NULL DEFAULT 'all',
-        created_at      TEXT NOT NULL DEFAULT (datetime('now')),
-        updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
-    );
-    CREATE INDEX IF NOT EXISTS idx_skills_category ON skills(category);
-    CREATE INDEX IF NOT EXISTS idx_skills_confidence ON skills(confidence DESC);
-    CREATE INDEX IF NOT EXISTS idx_skills_name ON skills(name);
     """)
 
     # Rebuild FTS5 from existing data after migration
@@ -1626,7 +1607,6 @@ class SaveRequest(BaseModel):
     id: Optional[str] = None
     derived_from: Optional[list[str]] = Field(default=None, description="来源记忆ID列表（进化产物血缘）")
     superseded_by: Optional[str] = Field(default=None, description="被哪条记忆取代（指向新记忆ID）")
-    insights: Optional[str] = Field(default=None, max_length=5000, description="提炼结论：从这条记忆学到了什么")
 
 
 class UpdateRequest(BaseModel):
@@ -1693,38 +1673,6 @@ class OffloadRequest(BaseModel):
 
 class DrilldownRequest(BaseModel):
     memory_id: str
-
-
-class SkillSaveRequest(BaseModel):
-    name: str = Field(..., min_length=1, max_length=200)
-    description: str = Field(default="", max_length=1000)
-    trigger_pattern: str = Field(default="", max_length=500)
-    content_md: str = Field(..., max_length=50000)
-    category: str = Field(default="general", pattern=r"^[a-z][a-z0-9_]{0,63}$")
-    source_memory_ids: Optional[list[str]] = None
-    confidence: float = Field(default=0.8, ge=0.0, le=1.0)
-    agent_scope: str = Field(default="all", pattern=r"^(all|hermes|claude|workbuddy)$")
-    id: Optional[str] = None
-
-
-class SkillMatchRequest(BaseModel):
-    query: str = Field(..., min_length=1, max_length=500)
-    category_filter: Optional[str] = None
-    min_confidence: float = Field(default=0.5, ge=0.0, le=1.0)
-    limit: int = Field(default=5, ge=1, le=20)
-
-
-class SkillListRequest(BaseModel):
-    category_filter: Optional[str] = None
-    min_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
-    limit: int = Field(default=50, ge=1, le=200)
-
-
-class SkillExtractRequest(BaseModel):
-    min_recall_count: int = Field(default=3, ge=1, le=100)
-    min_priority: str = Field(default="P0", pattern=r"^(P0|P1|P2)$")
-    limit: int = Field(default=10, ge=1, le=50)
-    dry_run: bool = Field(default=False, description="仅分析，不实际创建skill")
 
 
 # ── FastAPI App ──────────────────────────────────────────
@@ -3360,21 +3308,6 @@ MCP_TOOLS = [
         }
     },
     {
-        "name": "mem_insights_generate",
-        "description": "自我蒸馏：从高频记忆中自动提炼 insights（目标/摩擦点/结论），生成结构化的学习笔记。借鉴 Claude Code 的 facets 模式。",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "action": {"type": "string", "enum": ["generate", "list", "update"], "description": "操作类型：generate=从高频记忆生成insights，list=列出已有insights，update=更新指定记忆的insights"},
-                "memory_id": {"type": "string", "description": "指定记忆ID（update操作必填）"},
-                "insights": {"type": "string", "description": "insights内容（update操作必填）"},
-                "min_recall_count": {"type": "integer", "description": "最低召回次数阈值", "default": 3},
-                "limit": {"type": "integer", "description": "最大处理数量", "default": 20}
-            },
-            "required": ["action"]
-        }
-    },
-    {
         "name": "mem_evolve",
         "description": "CSSF自进化协议：分析记忆使用模式，生成元洞察（哪些知识被频繁使用、哪些被遗忘），自动优化记忆优先级。建议每周运行一次。",
         "inputSchema": {
@@ -3384,63 +3317,6 @@ MCP_TOOLS = [
                 "days": {"type": "integer", "description": "分析时间窗口（天）", "default": 30}
             },
             "required": ["action"]
-        }
-    },
-    {
-        "name": "mem_skill_save",
-        "description": "保存一个可复用技能到技能库。技能是从高频记忆中提取的结构化知识。",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "name": {"type": "string", "description": "技能名称"},
-                "description": {"type": "string", "description": "技能描述"},
-                "trigger_pattern": {"type": "string", "description": "触发模式（关键词或正则）"},
-                "content_md": {"type": "string", "description": "技能内容（Markdown格式）"},
-                "category": {"type": "string", "description": "分类", "default": "general"},
-                "source_memory_ids": {"type": "array", "items": {"type": "string"}, "description": "来源记忆ID列表"},
-                "confidence": {"type": "number", "description": "置信度(0-1)", "default": 0.8},
-                "agent_scope": {"type": "string", "enum": ["all", "hermes", "claude", "workbuddy"], "description": "适用Agent范围", "default": "all"}
-            },
-            "required": ["name", "content_md"]
-        }
-    },
-    {
-        "name": "mem_skill_match",
-        "description": "根据查询匹配相关技能。用于Agent在处理任务时查找可用技能。",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "查询内容"},
-                "category_filter": {"type": "string", "description": "分类过滤"},
-                "min_confidence": {"type": "number", "description": "最低置信度", "default": 0.5},
-                "limit": {"type": "integer", "description": "返回数量", "default": 5}
-            },
-            "required": ["query"]
-        }
-    },
-    {
-        "name": "mem_skill_list",
-        "description": "列出所有已保存的技能。",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "category_filter": {"type": "string", "description": "分类过滤"},
-                "min_confidence": {"type": "number", "description": "最低置信度", "default": 0.0},
-                "limit": {"type": "integer", "description": "返回数量", "default": 50}
-            }
-        }
-    },
-    {
-        "name": "mem_skill_extract",
-        "description": "从高频记忆中自动提取技能。分析recall_count高或P0优先级的记忆，识别可复用的模式。",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "min_recall_count": {"type": "integer", "description": "最低召回次数", "default": 3},
-                "min_priority": {"type": "string", "enum": ["P0", "P1", "P2"], "description": "最低优先级", "default": "P0"},
-                "limit": {"type": "integer", "description": "处理数量", "default": 10},
-                "dry_run": {"type": "boolean", "description": "仅分析不创建", "default": False}
-            }
         }
     }
 ]
@@ -3808,104 +3684,6 @@ async def handle_mcp_tools_call(request_id: Any, params: dict) -> dict:
 
             text = json.dumps(result, ensure_ascii=False, default=str)
 
-        elif tool_name == "mem_insights_generate":
-            action = arguments.get("action", "generate")
-            memory_id = arguments.get("memory_id")
-            insights_text = arguments.get("insights")
-            min_recall = arguments.get("min_recall_count", 3)
-            limit = arguments.get("limit", 20)
-
-            with db_conn() as db:
-                if action == "generate":
-                    # 从高频记忆中自动生成 insights（自我蒸馏）
-                    rows = db.execute(
-                        "SELECT id, content, type, category_id, recall_count, priority, source "
-                        "FROM memories WHERE archived=0 AND recall_count >= ? AND (insights IS NULL OR insights='') "
-                        "ORDER BY recall_count DESC LIMIT ?",
-                        (min_recall, limit)
-                    ).fetchall()
-
-                    generated = []
-                    for r in rows:
-                        # 简单的 insights 生成逻辑（基于内容特征）
-                        content = r["content"]
-                        insight_parts = []
-
-                        # 提取目标（如果内容包含"目标"、"目的"、"要"等关键词）
-                        if any(kw in content for kw in ["目标", "目的", "要", "需要", "应该"]):
-                            insight_parts.append("目标明确")
-
-                        # 提取摩擦点（如果内容包含"问题"、"困难"、"bug"、"错误"等）
-                        if any(kw in content for kw in ["问题", "困难", "bug", "错误", "失败", "卡住"]):
-                            insight_parts.append("存在摩擦点")
-
-                        # 提取结论（如果内容包含"结论"、"结果"、"发现"、"学到"等）
-                        if any(kw in content for kw in ["结论", "结果", "发现", "学到", "经验", "教训"]):
-                            insight_parts.append("有明确结论")
-
-                        # 如果没有匹配到关键词，生成通用 insight
-                        if not insight_parts:
-                            insight_parts.append(f"高频使用({r['recall_count']}次)")
-
-                        insight = " | ".join(insight_parts)
-                        generated.append({"id": r["id"], "content_preview": content[:100], "insight": insight})
-
-                        # 更新数据库
-                        db.execute(
-                            "UPDATE memories SET insights=? WHERE id=?",
-                            (insight, r["id"])
-                        )
-
-                    result = {
-                        "action": "generate",
-                        "generated_count": len(generated),
-                        "memories": generated,
-                        "message": f"为 {len(generated)} 条高频记忆生成了 insights"
-                    }
-
-                elif action == "list":
-                    # 列出已有 insights 的记忆
-                    rows = db.execute(
-                        "SELECT id, content, insights, recall_count, category_id "
-                        "FROM memories WHERE archived=0 AND insights IS NOT NULL AND insights != '' "
-                        "ORDER BY recall_count DESC LIMIT ?",
-                        (limit,)
-                    ).fetchall()
-
-                    result = {
-                        "action": "list",
-                        "count": len(rows),
-                        "memories": [dict(r) for r in rows]
-                    }
-
-                elif action == "update":
-                    # 更新指定记忆的 insights
-                    if not memory_id or not insights_text:
-                        result = {"error": "memory_id and insights are required for update action"}
-                    else:
-                        existing = db.execute(
-                            "SELECT id FROM memories WHERE id=? AND archived=0",
-                            (memory_id,)
-                        ).fetchone()
-                        if not existing:
-                            result = {"error": f"Memory {memory_id} not found"}
-                        else:
-                            db.execute(
-                                "UPDATE memories SET insights=?, updated_at=? WHERE id=?",
-                                (insights_text, now_iso(), memory_id)
-                            )
-                            result = {
-                                "action": "update",
-                                "success": True,
-                                "memory_id": memory_id,
-                                "insights": insights_text
-                            }
-
-                else:
-                    result = {"error": f"Unknown action: {action}"}
-
-            text = json.dumps(result, ensure_ascii=False, default=str)
-
         elif tool_name == "mem_evolve":
             action = arguments.get("action", "analyze")
             days = arguments.get("days", 30)
@@ -4056,26 +3834,6 @@ async def handle_mcp_tools_call(request_id: Any, params: dict) -> dict:
             result = await cache_stats()
             text = json.dumps(result, ensure_ascii=False)
 
-        elif tool_name == "mem_skill_save":
-            req = SkillSaveRequest(**arguments)
-            result = await save_skill(req)
-            text = json.dumps(result, ensure_ascii=False)
-
-        elif tool_name == "mem_skill_match":
-            req = SkillMatchRequest(**arguments)
-            result = await match_skill(req)
-            text = json.dumps(result, ensure_ascii=False)
-
-        elif tool_name == "mem_skill_list":
-            req = SkillListRequest(**arguments)
-            result = await list_skills(req)
-            text = json.dumps(result, ensure_ascii=False)
-
-        elif tool_name == "mem_skill_extract":
-            req = SkillExtractRequest(**arguments)
-            result = await extract_skills(req)
-            text = json.dumps(result, ensure_ascii=False)
-
         else:
             return {
                 "jsonrpc": "2.0",
@@ -4100,225 +3858,6 @@ async def handle_mcp_tools_call(request_id: Any, params: dict) -> dict:
                 "isError": True
             }
         }
-
-
-# ── Skill Functions ──────────────────────────────────────────
-
-async def save_skill(req: SkillSaveRequest) -> dict:
-    """保存一个技能到技能库"""
-    import uuid
-    skill_id = req.id or str(uuid.uuid4())
-    source_ids = json.dumps(req.source_memory_ids or [])
-
-    with db_conn() as db:
-        # Check if skill with same name exists
-        existing = db.execute(
-            "SELECT id FROM skills WHERE name = ?", (req.name,)
-        ).fetchone()
-
-        if existing:
-            # Update existing skill
-            db.execute("""
-                UPDATE skills SET
-                    description = ?, trigger_pattern = ?, content_md = ?,
-                    category = ?, source_memory_ids = ?, confidence = ?,
-                    agent_scope = ?, updated_at = datetime('now')
-                WHERE id = ?
-            """, (req.description, req.trigger_pattern, req.content_md,
-                  req.category, source_ids, req.confidence,
-                  req.agent_scope, existing["id"]))
-            skill_id = existing["id"]
-            action = "updated"
-        else:
-            # Insert new skill
-            db.execute("""
-                INSERT INTO skills (id, name, description, trigger_pattern,
-                    content_md, category, source_memory_ids, confidence, agent_scope)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (skill_id, req.name, req.description, req.trigger_pattern,
-                  req.content_md, req.category, source_ids, req.confidence,
-                  req.agent_scope))
-            action = "created"
-
-    return {
-        "id": skill_id,
-        "action": action,
-        "name": req.name,
-        "category": req.category,
-        "confidence": req.confidence
-    }
-
-
-async def match_skill(req: SkillMatchRequest) -> dict:
-    """根据查询匹配相关技能"""
-    with db_conn() as db:
-        # Build query
-        sql = """
-            SELECT id, name, description, trigger_pattern, content_md,
-                   category, confidence, recall_count, agent_scope
-            FROM skills
-            WHERE confidence >= ?
-        """
-        params: list = [req.min_confidence]
-
-        if req.category_filter:
-            sql += " AND category = ?"
-            params.append(req.category_filter)
-
-        # Search in name, description, trigger_pattern, content_md
-        sql += " AND (name LIKE ? OR description LIKE ? OR trigger_pattern LIKE ? OR content_md LIKE ?)"
-        query_pattern = f"%{req.query}%"
-        params.extend([query_pattern] * 4)
-
-        sql += " ORDER BY confidence DESC, recall_count DESC LIMIT ?"
-        params.append(req.limit)
-
-        results = []
-        for row in db.execute(sql, params).fetchall():
-            skill = dict(row)
-            # Update recall_count
-            db.execute(
-                "UPDATE skills SET recall_count = recall_count + 1 WHERE id = ?",
-                (skill["id"],)
-            )
-            results.append(skill)
-
-    return {
-        "query": req.query,
-        "matches": len(results),
-        "skills": results
-    }
-
-
-async def list_skills(req: SkillListRequest) -> dict:
-    """列出所有技能"""
-    with db_conn() as db:
-        sql = "SELECT * FROM skills WHERE confidence >= ?"
-        params: list = [req.min_confidence]
-
-        if req.category_filter:
-            sql += " AND category = ?"
-            params.append(req.category_filter)
-
-        sql += " ORDER BY confidence DESC, recall_count DESC LIMIT ?"
-        params.append(req.limit)
-
-        results = [dict(row) for row in db.execute(sql, params).fetchall()]
-
-    return {
-        "total": len(results),
-        "skills": results
-    }
-
-
-async def extract_skills(req: SkillExtractRequest) -> dict:
-    """从高频记忆中自动提取技能"""
-    with db_conn() as db:
-        # Find high-recall or high-priority memories
-        sql = """
-            SELECT id, content, category_id, type, priority, recall_count, tags
-            FROM memories
-            WHERE archived = 0 AND (
-                recall_count >= ? OR priority = ?
-            )
-            ORDER BY recall_count DESC, priority ASC
-            LIMIT ?
-        """
-        candidates = []
-        for row in db.execute(sql, (req.min_recall_count, req.min_priority, req.limit)).fetchall():
-            candidates.append(dict(row))
-
-    if req.dry_run:
-        return {
-            "mode": "dry_run",
-            "candidates_found": len(candidates),
-            "candidates": [
-                {
-                    "id": c["id"],
-                    "content_preview": c["content"][:100],
-                    "recall_count": c["recall_count"],
-                    "priority": c["priority"],
-                    "category": c["category_id"]
-                }
-                for c in candidates
-            ]
-        }
-
-    # Extract skills from candidates
-    extracted_skills = []
-    for mem in candidates:
-        content = mem["content"]
-
-        # Simple skill extraction heuristics
-        skill_name = ""
-        skill_desc = ""
-        trigger = ""
-        category = mem["category_id"] or "general"
-
-        # Check if content looks like a procedure/workflow
-        if any(kw in content for kw in ["步骤", "流程", "方法", "如何", "怎么", "操作"]):
-            skill_name = f"流程：{content[:50]}..."
-            skill_desc = f"从记忆 {mem['id'][:8]} 提取的工作流程"
-            trigger = "步骤|流程|方法|操作"
-            category = "workflow"
-
-        # Check if content is a preference/rule
-        elif any(kw in content for kw in ["偏好", "喜欢", "习惯", "规则", "要求", "必须"]):
-            skill_name = f"偏好：{content[:50]}..."
-            skill_desc = f"从记忆 {mem['id'][:8]} 提取的用户偏好"
-            trigger = "偏好|喜欢|习惯|规则"
-            category = "preference"
-
-        # Check if content is technical knowledge
-        elif any(kw in content for kw in ["技术", "架构", "配置", "部署", "命令", "代码"]):
-            skill_name = f"技术：{content[:50]}..."
-            skill_desc = f"从记忆 {mem['id'][:8]} 提取的技术知识"
-            trigger = "技术|架构|配置|部署"
-            category = "technical"
-
-        # Check if content is a decision/strategy
-        elif any(kw in content for kw in ["决策", "策略", "方案", "选择", "判断"]):
-            skill_name = f"决策：{content[:50]}..."
-            skill_desc = f"从记忆 {mem['id'][:8]} 提取的决策模式"
-            trigger = "决策|策略|方案|选择"
-            category = "decision"
-
-        else:
-            # Generic skill
-            skill_name = f"知识：{content[:50]}..."
-            skill_desc = f"从记忆 {mem['id'][:8]} 提取的知识"
-            trigger = content[:20]
-            category = "general"
-
-        # Calculate confidence based on recall_count and priority
-        confidence = 0.5
-        if mem["recall_count"] >= 5:
-            confidence = 0.9
-        elif mem["recall_count"] >= 3:
-            confidence = 0.8
-        if mem["priority"] == "P0":
-            confidence = min(1.0, confidence + 0.1)
-
-        skill = SkillSaveRequest(
-            name=skill_name,
-            description=skill_desc,
-            trigger_pattern=trigger,
-            content_md=content,
-            category=category,
-            source_memory_ids=[mem["id"]],
-            confidence=confidence,
-            agent_scope="all"
-        )
-
-        result = await save_skill(skill)
-        extracted_skills.append(result)
-
-    return {
-        "mode": "extracted",
-        "candidates_processed": len(candidates),
-        "skills_created": len(extracted_skills),
-        "skills": extracted_skills
-    }
 
 
 @app.post("/mcp")
@@ -4427,15 +3966,15 @@ async def batch_save(req: BatchSaveRequest) -> dict:
                 """INSERT INTO memories
                    (id, content, type, scope, source, priority, confidence, tags, category_id,
                     embedding, hot_tier, ttl_days, vector_clock,
-                    created_at, updated_at, recall_count, archived, checksum, simhash, insights)
-                   VALUES (?, ?, ?, ?, ?, ?, 0.8, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?)""",
+                    created_at, updated_at, recall_count, archived, checksum, simhash)
+                   VALUES (?, ?, ?, ?, ?, ?, 0.8, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?)""",
                 (memory_id, mem.content.strip(), mem_type, mem.scope,
                  mem.source, mem.priority or "P1", tags_json, category_id,
                  embedding_blob,
                  1 if (mem.priority or "P1") == "P0" else 0,
                  DEFAULT_TTL.get(mem.priority or "P1", 0),
                  init_clock,
-                 now, now, checksum, simhash_val, mem.insights or ""),
+                 now, now, checksum, simhash_val),
             )
 
             if mem.session_id:
