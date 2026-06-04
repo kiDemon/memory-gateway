@@ -47,7 +47,7 @@ def init_db(db: sqlite3.Connection) -> None:
         db.commit()
         # Backfill simhash for existing records
         # (lazy import to avoid circular dependency with server.py)
-        from server import compute_simhash
+        from memory_gateway.utils.crypto import compute_simhash
 
         rows = db.execute(
             "SELECT id, content FROM memories WHERE simhash='' OR simhash IS NULL"
@@ -437,7 +437,7 @@ def init_db(db: sqlite3.Connection) -> None:
             )
             import uuid as _uuid
             # (lazy import to avoid circular dependency with server.py)
-            from server import compute_checksum
+            from memory_gateway.utils.crypto import compute_checksum
 
             # 批量获取所有记忆
             rows = db.execute(
