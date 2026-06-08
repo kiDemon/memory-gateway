@@ -118,8 +118,17 @@ async def dashboard_memories(
     params: list[Any] = []
 
     if q:
-        conditions.append("content LIKE ?")
-        params.append(f"%{q}%")
+        # 检查是否为 UUID 格式的 ID
+        import re
+        uuid_pattern = r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+        if re.match(uuid_pattern, q.strip(), re.IGNORECASE):
+            # 直接用 ID 查询
+            conditions.append("id=?")
+            params.append(q.strip())
+        else:
+            # 普通内容搜索
+            conditions.append("content LIKE ?")
+            params.append(f"%{q}%")
     if category:
         conditions.append("category_id=?")
         params.append(category)
