@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Memory Gateway Dashboard</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js" integrity="sha384-e6nUZLBkQ86NJ6TVVKAeSaK8jWa3NhkYWZFomE39AvDbQWeie9PlQqM3pmYW5d1g" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/d3@7.9.0/dist/d3.min.js"></script>
 <style>
 :root {
   --bg: #0f1117; --bg2: #161822; --bg3: #1e2030;
@@ -92,6 +93,7 @@ tr:hover { background:var(--bg3); }
   <div class="tab" data-tab="memories">🔍 记忆浏览器</div>
   <div class="tab" data-tab="evolution">🧬 进化追踪</div>
   <div class="tab" data-tab="tools">🛠️ 智能工具</div>
+  <div class="tab" data-tab="graph">🕸️ 知识图谱</div>
   <div class="tab" data-tab="system">⚙️ 系统监控</div>
   <div class="tab" data-tab="settings">⚙️ 设置</div>
 </div>
@@ -173,6 +175,38 @@ tr:hover { background:var(--bg3); }
       <button class="btn secondary" onclick="runEvolve('insights')">💡 洞察</button>
     </div>
     <div id="evolveResult"><div class="loading">点击按钮运行自我进化</div></div>
+  </div>
+  <div style="height:16px"></div>
+  <div class="card">
+    <h3>🩺 知识健康检查 (Lint)</h3>
+    <div style="display:flex;gap:8px;margin-top:8px;">
+      <button class="btn" onclick="runLint()">🔍 运行检查</button>
+    </div>
+    <div id="lintResult"><div class="loading">点击按钮检查：孤立记忆、过期记忆、空标签、零召回等</div></div>
+  </div>
+</div>
+
+<!-- 知识图谱 -->
+<div class="content hidden" id="tab-graph">
+  <div style="display:flex;align-items:center;gap:16px;margin-bottom:16px;">
+    <div style="display:flex;gap:8px;align-items:center;">
+      <label style="color:var(--text2);font-size:13px;">显示边数:</label>
+      <select id="graphEdgeLimit" style="width:80px;">
+        <option value="50">50</option>
+        <option value="100">100</option>
+        <option value="200" selected>200</option>
+        <option value="500">500</option>
+      </select>
+    </div>
+    <button class="btn" onclick="loadD3Graph()">🔄 刷新图谱</button>
+    <span id="graphStats" style="color:var(--text2);font-size:13px;"></span>
+  </div>
+  <div id="graphContainer" style="background:var(--bg2);border:1px solid var(--border);border-radius:8px;overflow:hidden;position:relative;">
+    <svg id="graphSvg" style="width:100%;height:600px;"></svg>
+    <div id="graphTooltip" style="position:absolute;background:var(--bg3);border:1px solid var(--border);border-radius:6px;padding:8px 12px;font-size:12px;color:var(--text);pointer-events:none;display:none;z-index:10;max-width:300px;"></div>
+  </div>
+  <div style="margin-top:8px;color:var(--text2);font-size:12px;">
+    💡 拖拽节点移动 | 滚轮缩放 | 点击节点查看关联 | 节点大小=关联度 | 边粗细=强度
   </div>
 </div>
 
@@ -307,6 +341,7 @@ document.querySelectorAll('.tab').forEach(tab => {
     if (tab.dataset.tab === 'memories') searchMemories();
     if (tab.dataset.tab === 'system') loadSystem();
     if (tab.dataset.tab === 'tools') loadTools();
+    if (tab.dataset.tab === 'graph') loadD3Graph();
     if (tab.dataset.tab === 'settings') loadSettings();
   });
 });
@@ -792,6 +827,238 @@ const savedKey = localStorage.getItem('mg_api_key');
 if (savedKey) document.getElementById('apiKeyInput').value = savedKey;
 loadOverview();
 initCategories();
+
+// ═══ D3.js 知识图谱 ═══
+let graphSimulation = null;
+
+async function loadD3Graph() {
+  const limit = parseInt(document.getElementById('graphEdgeLimit').value) || 200;
+  const d = await fetchJSON('/api/dashboard/graph?limit=' + limit);
+
+  const statsEl = document.getElementById('graphStats');
+  if (d.stats) {
+    statsEl.textContent = `节点: ${d.nodes?.length || 0} | 边: ${d.edges?.length || 0} / 总: ${d.stats.total_edges}`;
+  }
+
+  if (!d.nodes || d.nodes.length === 0) {
+    document.getElementById('graphStats').textContent = '图谱为空 — 保存记忆后自动生成知识图谱';
+    return;
+  }
+
+  const svg = d3.select('#graphSvg');
+  svg.selectAll('*').remove();
+
+  const container = document.getElementById('graphContainer');
+  const width = container.clientWidth || 1200;
+  const height = 600;
+
+  svg.attr('viewBox', [0, 0, width, height]);
+
+  // Color scale by degree
+  const maxDegree = Math.max(...d.nodes.map(n => n.degree), 1);
+  const colorScale = d3.scaleSequential(d3.interpolateCool).domain([0, maxDegree]);
+  const sizeScale = d3.scaleSqrt().domain([1, maxDegree]).range([4, 18]);
+
+  // Prepare data
+  const nodes = d.nodes.map(n => ({
+    id: n.id,
+    degree: n.degree,
+    radius: sizeScale(n.degree),
+  }));
+
+  const nodeMap = new Map(nodes.map(n => [n.id, n]));
+
+  // Filter edges to only include those with both endpoints
+  const edges = d.edges.filter(e => nodeMap.has(e.source_id) && nodeMap.has(e.target_id))
+    .map(e => ({
+      source: e.source_id,
+      target: e.target_id,
+      strength: e.strength,
+      relation: e.relation,
+    }));
+
+  // Zoom
+  const zoom = d3.zoom()
+    .scaleExtent([0.1, 4])
+    .on('zoom', (event) => g.attr('transform', event.transform));
+  svg.call(zoom);
+
+  const g = svg.append('g');
+
+  // Arrow marker
+  svg.append('defs').append('marker')
+    .attr('id', 'arrow')
+    .attr('viewBox', '0 -3 6 6')
+    .attr('refX', 10)
+    .attr('refY', 0)
+    .attr('markerWidth', 4)
+    .attr('markerHeight', 4)
+    .attr('orient', 'auto')
+    .append('path')
+    .attr('d', 'M0,-3L6,0L0,3')
+    .attr('fill', '#565f89');
+
+  // Simulation
+  if (graphSimulation) graphSimulation.stop();
+
+  graphSimulation = d3.forceSimulation(nodes)
+    .force('link', d3.forceLink(edges).id(d => d.id).distance(80).strength(d => d.strength * 0.3))
+    .force('charge', d3.forceManyBody().strength(-120))
+    .force('center', d3.forceCenter(width / 2, height / 2))
+    .force('collision', d3.forceCollide().radius(d => d.radius + 2));
+
+  // Edges
+  const link = g.append('g')
+    .selectAll('line')
+    .data(edges)
+    .join('line')
+    .attr('stroke', '#2a2d3e')
+    .attr('stroke-opacity', 0.6)
+    .attr('stroke-width', d => Math.max(0.5, d.strength * 2))
+    .attr('marker-end', 'url(#arrow)');
+
+  // Nodes
+  const node = g.append('g')
+    .selectAll('circle')
+    .data(nodes)
+    .join('circle')
+    .attr('r', d => d.radius)
+    .attr('fill', d => colorScale(d.degree))
+    .attr('stroke', '#0f1117')
+    .attr('stroke-width', 1.5)
+    .style('cursor', 'pointer')
+    .call(d3.drag()
+      .on('start', (event, d) => {
+        if (!event.active) graphSimulation.alphaTarget(0.3).restart();
+        d.fx = d.x; d.fy = d.y;
+      })
+      .on('drag', (event, d) => { d.fx = event.x; d.fy = event.y; })
+      .on('end', (event, d) => {
+        if (!event.active) graphSimulation.alphaTarget(0);
+        d.fx = null; d.fy = null;
+      })
+    );
+
+  // Labels
+  const label = g.append('g')
+    .selectAll('text')
+    .data(nodes.filter(n => n.degree >= 2))
+    .join('text')
+    .text(d => d.id)
+    .attr('font-size', d => Math.max(9, Math.min(13, d.radius + 4)))
+    .attr('fill', '#c0caf5')
+    .attr('text-anchor', 'middle')
+    .attr('dy', d => d.radius + 14)
+    .style('pointer-events', 'none')
+    .style('text-shadow', '0 1px 2px #0f1117');
+
+  // Tooltip
+  const tooltip = document.getElementById('graphTooltip');
+
+  node.on('mouseover', (event, d) => {
+    tooltip.style.display = 'block';
+    tooltip.innerHTML = `<strong>${escapeHtml(d.id)}</strong><br>关联度: ${d.degree}`;
+    tooltip.style.left = (event.offsetX + 12) + 'px';
+    tooltip.style.top = (event.offsetY - 30) + 'px';
+    // Highlight connected edges
+    link.attr('stroke', l => (l.source.id === d.id || l.target.id === d.id) ? '#7aa2f7' : '#2a2d3e')
+        .attr('stroke-opacity', l => (l.source.id === d.id || l.target.id === d.id) ? 1 : 0.15);
+    node.attr('opacity', n => {
+      if (n.id === d.id) return 1;
+      const connected = edges.some(e => (e.source.id === d.id && e.target.id === n.id) || (e.target.id === d.id && e.source.id === n.id));
+      return connected ? 1 : 0.15;
+    });
+    label.attr('opacity', n => {
+      if (n.id === d.id) return 1;
+      const connected = edges.some(e => (e.source.id === d.id && e.target.id === n.id) || (e.target.id === d.id && e.source.id === n.id));
+      return connected ? 1 : 0.1;
+    });
+  })
+  .on('mouseout', () => {
+    tooltip.style.display = 'none';
+    link.attr('stroke', '#2a2d3e').attr('stroke-opacity', 0.6);
+    node.attr('opacity', 1);
+    label.attr('opacity', 1);
+  })
+  .on('click', (event, d) => {
+    // Search for related memories
+    const q = d.id;
+    document.getElementById('searchInput').value = q;
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    document.querySelectorAll('.content').forEach(c => c.classList.add('hidden'));
+    document.querySelector('[data-tab="memories"]').classList.add('active');
+    document.getElementById('tab-memories').classList.remove('hidden');
+    searchMemories();
+  });
+
+  // Tick
+  graphSimulation.on('tick', () => {
+    link.attr('x1', d => d.source.x).attr('y1', d => d.source.y)
+        .attr('x2', d => d.target.x).attr('y2', d => d.target.y);
+    node.attr('cx', d => d.x).attr('cy', d => d.y);
+    label.attr('x', d => d.x).attr('y', d => d.y);
+  });
+}
+
+// ═══ 知识健康检查 (Lint) ═══
+async function runLint() {
+  const div = document.getElementById('lintResult');
+  div.innerHTML = '<div class="loading">⏳ 正在扫描知识库健康状态...</div>';
+  const d = await fetchPost('/mcp', {
+    jsonrpc: "2.0", id: 1, method: "tools/call",
+    params: { name: "mem_lint", arguments: {} }
+  });
+  if (d.error) {
+    div.innerHTML = `<div style="color:var(--red)">错误: ${escapeHtml(typeof d.error === 'string' ? d.error : JSON.stringify(d.error))}</div>`;
+    return;
+  }
+  if (d.result?.isError) {
+    const errText = d.result.content?.[0]?.text || 'Unknown MCP error';
+    div.innerHTML = `<div style="color:var(--red)">MCP错误: ${escapeHtml(errText)}</div>`;
+    return;
+  }
+  const text = d.result?.content?.[0]?.text || JSON.stringify(d, null, 2);
+  let parsed;
+  try { parsed = JSON.parse(text); } catch(e) { parsed = null; }
+
+  if (parsed && parsed.success && parsed.issues) {
+    const issues = parsed.issues;
+    const summary = parsed.summary || {};
+    let html = `<div style="margin-bottom:12px;"><span style="color:var(--accent);font-weight:700;">检查完成</span> — 扫描 ${summary.total_checked || 0} 条记忆，发现 <span style="color:var(--yellow);font-weight:700;">${summary.issues_found || 0}</span> 个问题</div>`;
+
+    const categories = [
+      { key: 'stale', label: '⏰ 过期记忆 (90天未访问)', color: 'var(--yellow)' },
+      { key: 'empty_tags', label: '🏷️ 空标签', color: 'var(--cyan)' },
+      { key: 'zero_recall', label: '🔇 零召回 (30天+)', color: 'var(--text2)' },
+      { key: 'unknown_source', label: '❓ 未知来源', color: 'var(--purple)' },
+      { key: 'high_conf_no_recall', label: '💎 高置信零召回', color: 'var(--green)' },
+      { key: 'orphaned', label: '🏝️ 孤立记忆 (无图谱关联)', color: 'var(--red)' },
+    ];
+
+    for (const cat of categories) {
+      const items = issues[cat.key] || [];
+      if (items.length === 0) continue;
+      html += `<div style="margin-top:12px;"><span style="color:${cat.color};font-weight:600;">${cat.label}</span> (${items.length})</div>`;
+      html += '<div style="max-height:150px;overflow-y:auto;margin-top:4px;">';
+      for (const item of items.slice(0, 10)) {
+        const preview = escapeHtml((item.content_preview || '').slice(0, 80));
+        const extra = item.days_idle ? ` · 空闲${item.days_idle}天` : '';
+        const conf = item.confidence ? ` · 置信度${item.confidence.toFixed(2)}` : '';
+        html += `<div style="font-size:12px;color:var(--text2);padding:4px 0;border-bottom:1px solid var(--border);">${preview}...${extra}${conf}</div>`;
+      }
+      if (items.length > 10) html += `<div style="font-size:11px;color:var(--text2);padding:4px;">...还有 ${items.length - 10} 条</div>`;
+      html += '</div>';
+    }
+
+    if (summary.issues_found === 0) {
+      html += '<div style="color:var(--green);margin-top:12px;">✅ 知识库健康状况良好，未发现问题！</div>';
+    }
+
+    div.innerHTML = html;
+  } else {
+    div.innerHTML = `<pre style="white-space:pre-wrap;font-size:13px;background:var(--bg);padding:12px;border-radius:6px;max-height:400px;overflow-y:auto;">${escapeHtml(typeof parsed === 'object' ? JSON.stringify(parsed, null, 2) : String(parsed))}</pre>`;
+  }
+}
 </script>
 </body>
 </html>

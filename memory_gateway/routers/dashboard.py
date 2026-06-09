@@ -217,6 +217,50 @@ async def dashboard_evolution(memory_id: str):
     }
 
 
+@router.get("/api/dashboard/graph")
+async def dashboard_graph(limit: int = 200):
+    """Return knowledge graph data for D3.js visualization.
+
+    Returns nodes (terms) and edges (relations) suitable for a force-directed graph.
+    """
+    with db_conn() as db:
+        # Get edges from memory_relations
+        rows = db.execute(
+            """SELECT source_id, target_id, relation, strength
+               FROM memory_relations
+               ORDER BY strength DESC LIMIT ?""",
+            (limit,),
+        ).fetchall()
+        edges = [dict(r) for r in rows]
+
+        # Collect unique node IDs
+        node_ids = set()
+        for e in edges:
+            node_ids.add(e["source_id"])
+            node_ids.add(e["target_id"])
+
+        # For each term, count how many memories reference it
+        nodes = []
+        for term in node_ids:
+            # Count co-occurrence degree (both directions)
+            degree = db.execute(
+                """SELECT COUNT(*) FROM memory_relations
+                   WHERE source_id=? OR target_id=?""",
+                (term, term),
+            ).fetchone()[0]
+            nodes.append({"id": term, "degree": degree})
+
+        # Graph stats
+        total_edges = db.execute("SELECT COUNT(*) FROM memory_relations").fetchone()[0]
+        total_terms = len(node_ids)
+
+    return {
+        "nodes": nodes,
+        "edges": edges,
+        "stats": {"total_terms": total_terms, "total_edges": total_edges, "showing": len(edges)},
+    }
+
+
 @router.get("/api/dashboard/health")
 async def dashboard_health():
     """Return system health: DB stats, sync status, version stats."""

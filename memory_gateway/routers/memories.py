@@ -9,7 +9,7 @@ import logging
 import sqlite3
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException
@@ -71,9 +71,16 @@ async def save_memory(req: SaveRequest) -> dict:
     checksum = compute_checksum(content)
     simhash = compute_simhash(content)
     mem_type = req.type or detect_type(content)
-    tags_json = json.dumps(req.tags or [])
+    # Auto-generate tags if empty (None or [])
+    tags = req.tags
+    if not tags:
+        tags = _extract_key_terms(content)[:5]
+        log.info(f"Auto-generated tags for memory {memory_id[:8]}: {tags}")
+    tags_json = json.dumps(tags)
     category_id = req.category_id or "general"
     confidence = _compute_confidence(mem_type, req.source or "unknown", len(content))
+    if req.source == "unknown":
+        log.warning(f"Memory {memory_id[:8]} saved with source='unknown'")
 
     with db_conn() as db:
         existing = db.execute(
@@ -1104,3 +1111,128 @@ async def batch_delete(req: BatchDeleteRequest) -> dict:
         log.info(f"Batch deleted {count} memories (source={req.source}, category={req.category_id})")
 
     return {"success": True, "deleted": count}
+
+
+# ── Lint ──────────────────────────────────────────────────
+
+
+async def lint_memories() -> dict:
+    """Check memory health and return issues found."""
+    from memory_gateway.routers._shared import _extract_key_terms
+
+    now = datetime.now(timezone.utc)
+    issues = {
+        "stale": [],
+        "empty_tags": [],
+        "zero_recall": [],
+        "unknown_source": [],
+        "high_conf_no_recall": [],
+    }
+
+    with db_conn() as db:
+        # Get all non-archived memories
+        rows = db.execute(
+            "SELECT id, content, source, priority, confidence, tags, created_at, "
+            "last_recalled, recall_count, archived "
+            "FROM memories WHERE archived=0"
+        ).fetchall()
+
+        total_checked = len(rows)
+        log.info(f"mem_lint: scanning {total_checked} active memories")
+
+        # ── 2. Stale (archived=0, priority!=P0, last_recalled=NULL, created > 90d) ──
+        stale_cutoff = now - timedelta(days=90)
+        stale_iso = stale_cutoff.isoformat()
+        stale_rows = db.execute(
+            "SELECT id, content, created_at FROM memories "
+            "WHERE archived=0 AND priority!='P0' AND last_recalled IS NULL "
+            "AND created_at < ?",
+            (stale_iso,),
+        ).fetchall()
+        for r in stale_rows:
+            created = datetime.fromisoformat(r["created_at"])
+            days_idle = (now - created).days
+            issues["stale"].append({
+                "id": r["id"],
+                "content_preview": r["content"][:120],
+                "days_idle": days_idle,
+            })
+
+        # ── 3. Empty tags ──
+        empty_tag_rows = db.execute(
+            "SELECT id, content FROM memories WHERE archived=0 AND (tags IS NULL OR tags='[]')"
+        ).fetchall()
+        for r in empty_tag_rows:
+            issues["empty_tags"].append({
+                "id": r["id"],
+                "content_preview": r["content"][:120],
+            })
+
+        # ── 4. Zero recall (archived=0, recall_count=0, created > 30d) ──
+        zero_recall_cutoff = now - timedelta(days=30)
+        zero_recall_iso = zero_recall_cutoff.isoformat()
+        zero_rows = db.execute(
+            "SELECT id, content, created_at FROM memories "
+            "WHERE archived=0 AND recall_count=0 AND created_at < ?",
+            (zero_recall_iso,),
+        ).fetchall()
+        for r in zero_rows:
+            issues["zero_recall"].append({
+                "id": r["id"],
+                "content_preview": r["content"][:120],
+                "created_at": r["created_at"],
+            })
+
+        # ── 6. Unknown source ──
+        unknown_rows = db.execute(
+            "SELECT id, content FROM memories WHERE archived=0 AND source='unknown'"
+        ).fetchall()
+        for r in unknown_rows:
+            issues["unknown_source"].append({
+                "id": r["id"],
+                "content_preview": r["content"][:120],
+            })
+
+        # ── 7. High confidence, zero recall ──
+        high_conf_rows = db.execute(
+            "SELECT id, content, confidence FROM memories "
+            "WHERE archived=0 AND confidence > 0.9 AND recall_count=0"
+        ).fetchall()
+        for r in high_conf_rows:
+            issues["high_conf_no_recall"].append({
+                "id": r["id"],
+                "confidence": round(r["confidence"], 4),
+                "content_preview": r["content"][:120],
+            })
+
+        # ── 1. Orphaned memories ──
+        # Extract key terms from each memory and check if any appear in memory_relations.
+        # Memories whose extracted terms have no entries in the graph are orphaned.
+        orphaned = []
+        graph_terms = set()
+        for row in db.execute(
+            "SELECT DISTINCT source_id FROM memory_relations "
+            "UNION SELECT DISTINCT target_id FROM memory_relations"
+        ):
+            graph_terms.add(row[0])
+
+        for r in rows:
+            terms = _extract_key_terms(r["content"])
+            if terms and not any(t in graph_terms for t in terms):
+                orphaned.append({
+                    "id": r["id"],
+                    "content_preview": r["content"][:120],
+                })
+
+        if orphaned:
+            issues["orphaned"] = orphaned
+
+    total_issues = sum(len(v) for v in issues.values())
+    return {
+        "success": True,
+        "summary": {
+            "total_checked": total_checked,
+            "issues_found": total_issues,
+        },
+        "issues": issues,
+    }

@@ -49,6 +49,7 @@ from memory_gateway.routers.memories import (
     get_relations,
     get_scenario,
     history,
+    lint_memories,
     list_memory,
     offload_memory,
     save_memory,
@@ -420,6 +421,14 @@ MCP_TOOLS = [
                 "limit": {"type": "integer", "description": "处理数量", "default": 10},
                 "dry_run": {"type": "boolean", "description": "仅分析不创建", "default": False}
             }
+        }
+    },
+    {
+        "name": "mem_lint",
+        "description": "检查记忆库健康状态。扫描并报告孤立记忆、过期记忆、空标签、零召回、未知来源、高置信低召回等问题。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {}
         }
     }
 ]
@@ -1004,6 +1013,10 @@ async def handle_mcp_tools_call(request_id: Any, params: dict) -> dict:
             from memory_gateway.models.requests import SkillExtractRequest
             req = SkillExtractRequest(**arguments)
             result = await extract_skills(req)
+            text = json.dumps(result, ensure_ascii=False)
+
+        elif tool_name == "mem_lint":
+            result = await lint_memories()
             text = json.dumps(result, ensure_ascii=False)
 
         else:
