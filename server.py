@@ -595,14 +595,19 @@ app = FastAPI(
 # Dynamically build allowed origins from env or sensible defaults.
 # Wildcard origins are NOT compatible with credentials (cookies), so we
 # enumerate specific origins when credentials are needed.
+#
+# 环境变量 MEMORY_ALLOWED_ORIGINS 可以配置允许的来源（逗号分隔）
+# 例如: MEMORY_ALLOWED_ORIGINS="https://your-domain.com,http://localhost:8650"
 _ALLOWED_ORIGINS = os.environ.get("MEMORY_ALLOWED_ORIGINS", "")
 if _ALLOWED_ORIGINS:
     origins = [o.strip() for o in _ALLOWED_ORIGINS.split(",") if o.strip()]
 else:
-    # Safe default: localhost + container network origins
+    # Safe default: Dashboard + localhost origins for development
     origins = [
-        "http://localhost:3000",
-        "http://localhost:8093",
+        "http://localhost:8650",      # Memory Gateway Dashboard
+        "http://127.0.0.1:8650",     # Memory Gateway Dashboard (alternative)
+        "http://localhost:3000",      # Common dev server
+        "http://localhost:8093",      # Hermes Web UI
         "http://127.0.0.1:3000",
         "http://127.0.0.1:8093",
         "http://localhost:8080",

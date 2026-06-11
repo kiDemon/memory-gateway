@@ -9,6 +9,7 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException
 from memory_gateway.database.connection import db_conn
 from memory_gateway.models.requests import CategoryRequest, CategoryUpdateRequest
+from memory_gateway.routers._shared import hot_cache
 
 router = APIRouter(tags=["categories"])
 
@@ -92,4 +93,5 @@ async def delete_category(category_id: str) -> dict:
             raise HTTPException(status_code=400, detail="Cannot delete system categories")
         db.execute("UPDATE memories SET category_id='general' WHERE category_id=?", (category_id,))
         db.execute("DELETE FROM categories WHERE id=?", (category_id,))
+        hot_cache.clear()  # 清除搜索缓存
     return {"success": True, "action": "deleted", "category_id": category_id}

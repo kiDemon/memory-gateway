@@ -211,6 +211,44 @@ def _apply_full_schema(conn: sqlite3.Connection):
         created_at      TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
+    CREATE TABLE IF NOT EXISTS scenarios (
+        id              TEXT PRIMARY KEY,
+        category_id     TEXT NOT NULL DEFAULT 'general',
+        title           TEXT NOT NULL,
+        summary         TEXT NOT NULL,
+        memory_ids      TEXT NOT NULL DEFAULT '[]',
+        time_window_start TEXT,
+        time_window_end   TEXT,
+        created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    -- L3 画像层：用户/项目/领域画像
+    CREATE TABLE IF NOT EXISTS personas (
+        id              TEXT PRIMARY KEY,
+        persona_type    TEXT NOT NULL,
+        name            TEXT NOT NULL,
+        profile_md      TEXT NOT NULL DEFAULT '',
+        version         INTEGER NOT NULL DEFAULT 1,
+        created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS skills (
+        id              TEXT PRIMARY KEY,
+        name            TEXT NOT NULL,
+        description     TEXT NOT NULL DEFAULT '',
+        trigger_pattern TEXT NOT NULL DEFAULT '',
+        content_md      TEXT NOT NULL DEFAULT '',
+        category        TEXT NOT NULL DEFAULT 'general',
+        source_memory_ids TEXT NOT NULL DEFAULT '[]',
+        confidence      REAL NOT NULL DEFAULT 0.0,
+        recall_count    INTEGER NOT NULL DEFAULT 0,
+        agent_scope     TEXT NOT NULL DEFAULT 'all',
+        created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
     CREATE TABLE IF NOT EXISTS raw_memories (
         id              TEXT PRIMARY KEY,
         session_id      TEXT,
@@ -241,6 +279,69 @@ def _apply_full_schema(conn: sqlite3.Connection):
         unlock_time REAL NOT NULL,
         failure_count INTEGER NOT NULL DEFAULT 0
     );
+
+    -- FTS5 全文索引 (trigram prefix=2,1 支持1-2字符前缀查询)
+    CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+        content,
+        category_id,
+        tags,
+        type,
+        scope,
+        source,
+        content=memories,
+        content_rowid=rowid,
+        tokenize='trigram'
+    );
+
+    -- 触发器：插入时同步 FTS
+    CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
+        INSERT INTO memories_fts(rowid, content, category_id, tags, type, scope, source)
+        VALUES (new.rowid, new.content, new.category_id, new.tags, new.type, new.scope, new.source);
+    END;
+
+    -- 触发器：删除时同步 FTS
+    CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
+        INSERT INTO memories_fts(memories_fts, rowid, content, category_id, tags, type, scope, source)
+        VALUES ('delete', old.rowid, old.content, old.category_id, old.tags, old.type, old.scope, old.source);
+    END;
+
+    -- 触发器：更新时同步 FTS
+    CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
+        INSERT INTO memories_fts(memories_fts, rowid, content, category_id, tags, type, scope, source)
+        VALUES ('delete', old.rowid, old.content, old.category_id, old.tags, old.type, old.scope, old.source);
+        INSERT INTO memories_fts(rowid, content, category_id, tags, type, scope, source)
+        VALUES (new.rowid, new.content, new.category_id, new.tags, new.type, new.scope, new.source);
+    END;
+
+    -- 索引
+    CREATE INDEX IF NOT EXISTS idx_memories_type ON memories(type);
+    CREATE INDEX IF NOT EXISTS idx_memories_scope ON memories(scope);
+    CREATE INDEX IF NOT EXISTS idx_memories_source ON memories(source);
+    CREATE INDEX IF NOT EXISTS idx_memories_archived ON memories(archived);
+    CREATE INDEX IF NOT EXISTS idx_memories_created ON memories(created_at);
+    CREATE INDEX IF NOT EXISTS idx_memories_checksum ON memories(checksum);
+    CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category_id);
+    CREATE INDEX IF NOT EXISTS idx_memories_content ON memories(content);
+    CREATE INDEX IF NOT EXISTS idx_session_session ON session_memories(session_id);
+    CREATE INDEX IF NOT EXISTS idx_relations_source ON memory_relations(source_id);
+    CREATE INDEX IF NOT EXISTS idx_relations_target ON memory_relations(target_id);
+    CREATE INDEX IF NOT EXISTS idx_versions_memory ON memory_versions(memory_id, version DESC);
+    CREATE INDEX IF NOT EXISTS idx_versions_hash ON memory_versions(content_hash);
+    CREATE INDEX IF NOT EXISTS idx_evolution_memory ON evolution_log(memory_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_evolution_type ON evolution_log(event_type);
+    CREATE INDEX IF NOT EXISTS idx_branches_memory ON memory_branches(memory_id);
+    CREATE INDEX IF NOT EXISTS idx_branches_name ON memory_branches(memory_id, branch_name);
+    CREATE INDEX IF NOT EXISTS idx_audit_query ON search_audit_log(created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_audit_source ON search_audit_log(source, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_raw_session ON raw_memories(session_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_raw_memory ON raw_memories(memory_id);
+    CREATE INDEX IF NOT EXISTS idx_scenarios_category ON scenarios(category_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_personas_type ON personas(persona_type, name);
+    CREATE INDEX IF NOT EXISTS idx_skills_category ON skills(category);
+    CREATE INDEX IF NOT EXISTS idx_skills_confidence ON skills(confidence DESC);
+    CREATE INDEX IF NOT EXISTS idx_skills_name ON skills(name);
+    CREATE INDEX IF NOT EXISTS idx_login_attempts_ip ON login_attempts(ip_address, attempted_at);
+    CREATE INDEX IF NOT EXISTS idx_sessions_expires ON user_sessions(expires_at);
     """)
     conn.commit()
 

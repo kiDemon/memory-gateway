@@ -362,8 +362,8 @@ class TestListMemory:
     """Test /mcp/list endpoint."""
 
     def test_list_all(self, test_client):
-        test_client.post("/mcp/save", json={"content": "Memory A"})
-        test_client.post("/mcp/save", json={"content": "Memory B"})
+        test_client.post("/mcp/save", json={"content": "Memory Alpha for testing list functionality"})
+        test_client.post("/mcp/save", json={"content": "Memory Beta completely different content here"})
 
         resp = test_client.post("/mcp/list", json={"limit": 50})
         data = resp.json()
@@ -373,16 +373,16 @@ class TestListMemory:
     def test_list_with_category_filter(self, test_client):
         test_client.post(
             "/mcp/save",
-            json={"content": "Work item", "category_id": "work"},
+            json={"content": "Work item for category filter test with unique content", "category_id": "work"},
         )
         test_client.post(
             "/mcp/save",
-            json={"content": "Learning item", "category_id": "learning"},
+            json={"content": "Learning item for category filter test with different content", "category_id": "learning"},
         )
         resp = test_client.post(
             "/mcp/list",
             json={"category_filter": "work", "limit": 50},
         )
         data = resp.json()
-        for m in data["memories"]:
+        for m in data["results"]:
             assert m["category_id"] == "work"

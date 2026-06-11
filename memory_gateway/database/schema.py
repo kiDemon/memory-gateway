@@ -196,7 +196,9 @@ def init_db(db: sqlite3.Connection) -> None:
         archived    INTEGER NOT NULL DEFAULT 0,
         checksum    TEXT NOT NULL,
         simhash     TEXT DEFAULT '',
-        insights    TEXT DEFAULT ''
+        insights    TEXT DEFAULT '',
+        derived_from TEXT,
+        superseded_by TEXT
     );
 
     CREATE TABLE IF NOT EXISTS session_memories (

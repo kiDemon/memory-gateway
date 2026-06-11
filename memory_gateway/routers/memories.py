@@ -1109,6 +1109,7 @@ async def batch_delete(req: BatchDeleteRequest) -> dict:
 
         db.executemany("DELETE FROM memories WHERE id=?", id_params)
         log.info(f"Batch deleted {count} memories (source={req.source}, category={req.category_id})")
+        hot_cache.clear()  # 清除搜索缓存
 
     return {"success": True, "deleted": count}
 

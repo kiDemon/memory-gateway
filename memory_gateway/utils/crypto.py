@@ -63,7 +63,7 @@ def _find_near_duplicate(db: sqlite3.Connection, simhash: str, threshold: int = 
         if r["simhash"] and hamming_distance(simhash, r["simhash"]) < threshold:
             return {
                 "id": r["id"],
-                "content": r.get("content", ""),
+                "content": r["content"] if "content" in r.keys() else "",
                 "simhash": r["simhash"],
                 "distance": hamming_distance(simhash, r["simhash"]),
                 "similarity": round(1.0 - hamming_distance(simhash, r["simhash"]) / 64, 3),

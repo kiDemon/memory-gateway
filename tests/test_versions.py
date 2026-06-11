@@ -42,7 +42,7 @@ class TestVersionAutoCreate:
     def test_save_creates_version(self, test_client):
         resp = test_client.post(
             "/mcp/save",
-            json={"content": "Versioned memory", "source": "test"},
+            json={"content": "Versioned memory", "source": "unknown"},
         )
         mem_id = resp.json()["id"]
 
@@ -59,7 +59,7 @@ class TestVersionAutoCreate:
     def test_update_increments_version(self, test_client):
         resp = test_client.post(
             "/mcp/save",
-            json={"content": "Original v1", "source": "test"},
+            json={"content": "Original v1", "source": "unknown"},
         )
         mem_id = resp.json()["id"]
 
@@ -80,7 +80,7 @@ class TestVersionAutoCreate:
     def test_version_content_integrity(self, test_client):
         resp = test_client.post(
             "/mcp/save",
-            json={"content": "Version A content", "source": "test"},
+            json={"content": "Version A content", "source": "unknown"},
         )
         mem_id = resp.json()["id"]
 
@@ -116,7 +116,7 @@ class TestVersionHistory:
     def test_get_history_multiple_versions(self, test_client):
         resp = test_client.post(
             "/mcp/save",
-            json={"content": "Initial", "source": "test"},
+            json={"content": "Initial", "source": "unknown"},
         )
         mem_id = resp.json()["id"]
 
@@ -139,7 +139,7 @@ class TestVersionDiff:
     def test_diff_between_versions(self, test_client):
         resp = test_client.post(
             "/mcp/save",
-            json={"content": "Line 1\nLine 2\nLine 3", "source": "test"},
+            json={"content": "Line 1\nLine 2\nLine 3", "source": "unknown"},
         )
         mem_id = resp.json()["id"]
 
@@ -159,7 +159,7 @@ class TestVersionDiff:
     def test_diff_nonexistent_version(self, test_client):
         resp = test_client.post(
             "/mcp/save",
-            json={"content": "Test", "source": "test"},
+            json={"content": "Test", "source": "unknown"},
         )
         mem_id = resp.json()["id"]
 
@@ -178,7 +178,7 @@ class TestVersionRollback:
     def test_rollback_to_previous_version(self, test_client):
         resp = test_client.post(
             "/mcp/save",
-            json={"content": "Original content", "source": "test"},
+            json={"content": "Original content", "source": "unknown"},
         )
         mem_id = resp.json()["id"]
 
@@ -205,7 +205,7 @@ class TestVersionRollback:
         """Rollback creates a new version entry."""
         resp = test_client.post(
             "/mcp/save",
-            json={"content": "v1 content", "source": "test"},
+            json={"content": "v1 content", "source": "unknown"},
         )
         mem_id = resp.json()["id"]
 
@@ -230,7 +230,7 @@ class TestVersionRollback:
     def test_rollback_nonexistent_version(self, test_client):
         resp = test_client.post(
             "/mcp/save",
-            json={"content": "Test", "source": "test"},
+            json={"content": "Test", "source": "unknown"},
         )
         mem_id = resp.json()["id"]
 
@@ -248,7 +248,7 @@ class TestVersionBranches:
     def test_create_branch(self, test_client):
         resp = test_client.post(
             "/mcp/save",
-            json={"content": "Branch base content", "source": "test"},
+            json={"content": "Branch base content", "source": "unknown"},
         )
         mem_id = resp.json()["id"]
 
@@ -263,7 +263,7 @@ class TestVersionBranches:
     def test_branch_from_latest(self, test_client):
         resp = test_client.post(
             "/mcp/save",
-            json={"content": "Latest base", "source": "test"},
+            json={"content": "Latest base", "source": "unknown"},
         )
         mem_id = resp.json()["id"]
 
@@ -277,7 +277,7 @@ class TestVersionBranches:
     def test_list_branches(self, test_client):
         resp = test_client.post(
             "/mcp/save",
-            json={"content": "Multi-branch", "source": "test"},
+            json={"content": "Multi-branch", "source": "unknown"},
         )
         mem_id = resp.json()["id"]
 
@@ -305,7 +305,7 @@ class TestVersionBranches:
     def test_duplicate_branch_name_rejected(self, test_client):
         resp = test_client.post(
             "/mcp/save",
-            json={"content": "Branch dup test", "source": "test"},
+            json={"content": "Branch dup test", "source": "unknown"},
         )
         mem_id = resp.json()["id"]
 
@@ -328,7 +328,7 @@ class TestChangeLog:
     def test_save_logs_change(self, test_client):
         resp = test_client.post(
             "/mcp/save",
-            json={"content": "Change log test", "source": "test"},
+            json={"content": "Change log test", "source": "unknown"},
         )
         mem_id = resp.json()["id"]
 
@@ -341,7 +341,7 @@ class TestChangeLog:
     def test_update_logs_change(self, test_client):
         resp = test_client.post(
             "/mcp/save",
-            json={"content": "Original", "source": "test"},
+            json={"content": "Original", "source": "unknown"},
         )
         mem_id = resp.json()["id"]
 
@@ -363,7 +363,7 @@ class TestChangeLog:
     def test_rollback_logs_change(self, test_client):
         resp = test_client.post(
             "/mcp/save",
-            json={"content": "v1 content", "source": "test"},
+            json={"content": "v1 content", "source": "unknown"},
         )
         mem_id = resp.json()["id"]
 

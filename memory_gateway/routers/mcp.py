@@ -430,6 +430,21 @@ MCP_TOOLS = [
             "type": "object",
             "properties": {}
         }
+    },
+    {
+        "name": "mem_cleanup_db",
+        "description": "执行数据库清理：删除旧版本、旧关系、旧日志，并可选执行 VACUUM 优化。解决数据库膨胀问题。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "version_keep_count": {"type": "integer", "description": "每个记忆保留的版本数", "default": 10},
+                "relation_max_age_days": {"type": "integer", "description": "关系最大保留天数", "default": 90},
+                "change_log_max_age_days": {"type": "integer", "description": "变更日志最大保留天数", "default": 30},
+                "evolution_log_max_age_days": {"type": "integer", "description": "进化日志最大保留天数", "default": 180},
+                "search_audit_max_age_days": {"type": "integer", "description": "搜索审计日志最大保留天数", "default": 30},
+                "vacuum": {"type": "boolean", "description": "是否执行 VACUUM 优化", "default": True}
+            }
+        }
     }
 ]
 
@@ -537,6 +552,9 @@ async def handle_mcp_tools_call(request_id: Any, params: dict) -> dict:
             agent = arguments.get("agent", "system")
             with db_conn() as db:
                 rollback_result = VersionManager.rollback(db, memory_id, version, agent)
+            # 回滚后清除热缓存，确保搜索结果一致
+            if rollback_result.get("success"):
+                hot_cache.clear()
             text = json.dumps(rollback_result, ensure_ascii=False, default=str)
 
         elif tool_name == "mem_branch":
@@ -755,33 +773,60 @@ async def handle_mcp_tools_call(request_id: Any, params: dict) -> dict:
                     merged = 0
                     merge_log = []
                     seen: dict[str, str] = {}
+                    potential_merges = []  # 存储潜在的合并对
 
                     for i, r in enumerate(rows):
                         if r["checksum"] in seen:
+                            # 精确重复：直接归档
                             db.execute("UPDATE memories SET archived=1 WHERE id=?", (r["id"],))
                             merge_log.append({"archived": r["id"], "kept": seen[r["checksum"]], "reason": "exact_duplicate"})
                             merged += 1
                         else:
                             seen[r["checksum"]] = r["id"]
 
-                        if r["simhash"] and auto_merge:
-                            for j in range(i + 1, min(i + 30, len(rows))):
+                        # 扫描模糊重复（无论 auto_merge 是否为 True）
+                        if r["simhash"]:
+                            for j in range(i + 1, min(i + 50, len(rows))):
                                 other = rows[j]
-                                if other["simhash"] and not other["id"] in [m.get("archived") for m in merge_log]:
+                                if other["simhash"] and other["id"] not in [m.get("archived") for m in merge_log]:
                                     dist = hamming_distance(r["simhash"], other["simhash"])
-                                    if dist < 4:
-                                        db.execute("UPDATE memories SET archived=1 WHERE id=?", (other["id"],))
-                                        merge_log.append({"archived": other["id"], "kept": r["id"], "reason": "fuzzy_duplicate", "distance": dist})
-                                        merged += 1
+                                    if dist < 10:  # 扩大扫描范围
+                                        similarity = round(1.0 - dist / 64, 3)
+                                        potential_merge = {
+                                            "id1": r["id"],
+                                            "id2": other["id"],
+                                            "distance": dist,
+                                            "similarity": similarity,
+                                            "reason": "fuzzy_duplicate"
+                                        }
+                                        
+                                        # 根据相似度决定是否自动合并
+                                        if auto_merge and dist < 6:  # 高相似度：自动合并
+                                            db.execute("UPDATE memories SET archived=1 WHERE id=?", (other["id"],))
+                                            merge_log.append({"archived": other["id"], "kept": r["id"], "reason": "fuzzy_duplicate", "distance": dist, "auto_merged": True})
+                                            merged += 1
+                                        else:
+                                            # 记录为潜在合并候选
+                                            potential_merge["auto_merged"] = False
+                                            potential_merge["action_required"] = "manual_review"
+                                            merge_log.append(potential_merge)
 
                     if merged > 0:
                         hot_cache.clear()
                         db.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
 
+                    # 统计自动合并和需要人工审核的数量
+                    auto_merged_count = sum(1 for m in merge_log if m.get("auto_merged"))
+                    manual_review_count = sum(1 for m in merge_log if m.get("action_required") == "manual_review")
+                    
                     result = {
                         "merged": merged,
-                        "log": merge_log[:20],
-                        "message": f"合并完成：归档 {merged} 条冗余记忆" if merged > 0 else "无需合并，记忆库无冗余"
+                        "auto_merged": auto_merged_count,
+                        "manual_review_required": manual_review_count,
+                        "log": merge_log[:30],
+                        "message": f"合并完成：自动归档 {merged} 条冗余记忆" if merged > 0 else 
+                                   f"发现 {manual_review_count} 对潜在重复，需要人工审核" if manual_review_count > 0 else 
+                                   "无需合并，记忆库无冗余"
                     }
                 else:
                     result = {"error": f"Unknown action: {action}"}
@@ -1017,6 +1062,22 @@ async def handle_mcp_tools_call(request_id: Any, params: dict) -> dict:
 
         elif tool_name == "mem_lint":
             result = await lint_memories()
+            text = json.dumps(result, ensure_ascii=False)
+
+        elif tool_name == "mem_cleanup_db":
+            from memory_gateway.utils.cleanup import full_cleanup
+            from memory_gateway.config import DB_PATH
+            
+            # 执行数据库清理
+            result = full_cleanup(
+                db_path=str(DB_PATH),
+                version_keep_count=arguments.get("version_keep_count", 10),
+                relation_max_age_days=arguments.get("relation_max_age_days", 90),
+                change_log_max_age_days=arguments.get("change_log_max_age_days", 30),
+                evolution_log_max_age_days=arguments.get("evolution_log_max_age_days", 180),
+                search_audit_max_age_days=arguments.get("search_audit_max_age_days", 30),
+                vacuum=arguments.get("vacuum", True)
+            )
             text = json.dumps(result, ensure_ascii=False)
 
         else:

@@ -17,6 +17,9 @@ from memory_gateway.utils.crypto import compute_checksum, compute_simhash, hammi
 
 log = logging.getLogger("memory-server")
 
+# 版本保留策略：每个记忆最多保留的版本数
+VERSION_KEEP_COUNT = 10
+
 
 class VersionManager:
     """记忆版本管理器 - 实现 Git for Memory 的核心功能"""
@@ -29,6 +32,8 @@ class VersionManager:
 
         使用 INSERT ... SELECT MAX(version)+1 原子化分配版本号，
         避免并发场景下 SELECT + INSERT 之间的竞态条件。
+        
+        自动执行版本保留策略：创建新版本后，删除超过保留数量的旧版本。
         """
         version_id = str(uuid.uuid4())
         content_hash = compute_checksum(content)
@@ -90,6 +95,28 @@ class VersionManager:
         )
 
         log.info(f"Version {new_version} created for memory {memory_id[:8]}... ({change_type})")
+
+        # 自动执行版本保留策略：删除超过保留数量的旧版本
+        try:
+            version_count = db.execute(
+                "SELECT COUNT(*) FROM memory_versions WHERE memory_id=?",
+                (memory_id,)
+            ).fetchone()[0]
+            
+            if version_count > VERSION_KEEP_COUNT:
+                versions_to_delete = version_count - VERSION_KEEP_COUNT
+                db.execute("""
+                    DELETE FROM memory_versions 
+                    WHERE memory_id = ? AND version IN (
+                        SELECT version FROM memory_versions 
+                        WHERE memory_id = ? 
+                        ORDER BY version ASC 
+                        LIMIT ?
+                    )
+                """, (memory_id, memory_id, versions_to_delete))
+                log.info(f"Version retention: deleted {versions_to_delete} old versions for memory {memory_id[:8]}...")
+        except Exception as e:
+            log.warning(f"Version retention cleanup failed (non-fatal): {e}", exc_info=True)
 
         # Auto-detect bad evolution after version creation
         try:
@@ -164,7 +191,11 @@ class VersionManager:
     @staticmethod
     def rollback(db: sqlite3.Connection, memory_id: str,
                  target_version: int, agent: str = "system") -> dict:
-        """回滚到指定版本"""
+        """回滚到指定版本
+        
+        注意：FTS5 索引会通过数据库触发器(memories_au)自动更新，
+        无需手动重建。回滚后需要清除热缓存以确保搜索结果一致。
+        """
         target = VersionManager.get_version(db, memory_id, target_version)
         if not target:
             return {"error": f"Version {target_version} not found"}
@@ -184,6 +215,7 @@ class VersionManager:
         from_version = current_ver_row["v"] or 0
 
         # 更新记忆内容为历史版本
+        # 注意：FTS5 会通过 memories_au 触发器自动更新
         now = now_iso()
         db.execute(
             """UPDATE memories
@@ -208,7 +240,8 @@ class VersionManager:
             "memory_id": memory_id,
             "from_version": from_version,
             "target_version": target_version,
-            "new_version": new_ver
+            "new_version": new_ver,
+            "note": "FTS5 index updated automatically by trigger"
         }
 
     # ═══ Git for Memory: Branching & Multi-Agent Coordination ═══
