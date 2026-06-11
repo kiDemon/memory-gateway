@@ -177,26 +177,76 @@ _STOP_WORDS = {
     "但是", "如果", "虽然", "只是", "或者", "以及", "然后", "之后",
     "之前", "需要", "通过", "进行", "使用", "支持", "包含", "提供",
     "支持", "能够", "可能", "应该", "必须", "一个", "一种", "一条",
+    "比较", "非常", "特别", "主要", "基本", "目前", "现在", "今天",
+    "昨天", "明天", "最近", "刚才", "马上", "立刻", "一直", "从来",
 }
+
+# jieba 分词器（延迟加载）
+_jieba = None
+
+# 自定义词典
+_CUSTOM_WORDS = [
+    "Memory Gateway", "Hermes Agent", "Claude Code", "WorkBuddy",
+    "低空目标", "铁塔工匠", "智联业务", "应急预案", "代维",
+    "GIS可视化", "塔娃AI", "腾讯元宝", "知识图谱",
+    "备电评估", "微信工单", "4A权限", "管控系统",
+]
+
+def _get_jieba():
+    """延迟加载 jieba 分词器"""
+    global _jieba
+    if _jieba is None:
+        try:
+            import jieba
+            import jieba.posseg as pseg
+            # 添加自定义词典
+            for word in _CUSTOM_WORDS:
+                jieba.add_word(word)
+            _jieba = pseg
+            log.info("jieba 分词器加载成功，已添加 %d 个自定义词汇", len(_CUSTOM_WORDS))
+        except ImportError:
+            log.warning("jieba 未安装，使用正则回退方案")
+            _jieba = False
+    return _jieba
 
 
 def _extract_key_terms(content: str) -> list[str]:
     """Extract key terms from content for knowledge graph nodes.
 
-    Strategy (zero-dependency, no LLM):
-    1. Chinese: extract 2-4 char noun-like substrings via regex
-    2. English: extract capitalized words and technical terms
-    3. Filter stop words and very short tokens
-    Returns up to 12 unique key terms.
+    Strategy:
+    1. Try jieba for Chinese NLP (noun phrase extraction)
+    2. Fallback to regex if jieba unavailable
+    3. English: extract capitalized words and technical terms
+    Returns up to 15 unique key terms.
     """
     terms = set()
-
-    # Chinese: extract sequences of 2-4 Chinese characters (likely nouns/phrases)
-    cn_matches = re.findall(r'[\u4e00-\u9fff]{2,4}', content)
-    for m in cn_matches:
-        if m not in _STOP_WORDS and len(m) >= 2:
-            terms.add(m)
-
+    
+    # 尝试使用 jieba 分词
+    pseg = _get_jieba()
+    
+    if pseg and pseg is not False:
+        # 使用 jieba 词性标注提取名词短语
+        words = pseg.cut(content)
+        for word, flag in words:
+            word = word.strip()
+            if len(word) < 2:
+                continue
+            # 保留名词、动词、英文、以及自定义词汇（词性为 x 表示非语素字，通常是自定义词）
+            if flag.startswith(('n', 'v', 'eng')) or flag == 'x' or word in _CUSTOM_WORDS:
+                if word not in _STOP_WORDS:
+                    # 英文保持原样，中文直接添加
+                    if re.match(r'^[A-Za-z]', word):
+                        terms.add(word if word[0].isupper() else word.lower())
+                    else:
+                        terms.add(word)
+    else:
+        # 回退方案：正则提取
+        # Chinese: extract sequences of 2-4 Chinese characters
+        cn_matches = re.findall(r'[\u4e00-\u9fff]{2,4}', content)
+        for m in cn_matches:
+            if m not in _STOP_WORDS and len(m) >= 2:
+                terms.add(m)
+    
     # English: extract words 3+ chars, prefer capitalized and technical terms
     en_matches = re.findall(r'[A-Za-z_][A-Za-z0-9_]{2,}', content)
     for m in en_matches:
@@ -214,7 +264,7 @@ def _extract_key_terms(content: str) -> list[str]:
         if key not in seen or (t[0].isupper() and not seen[key][0].isupper()):
             seen[key] = t
 
-    return list(seen.values())[:12]
+    return list(seen.values())[:15]
 
 
 def _auto_create_relations(db: sqlite3.Connection, memory_id: str,
