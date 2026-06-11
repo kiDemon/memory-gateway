@@ -210,44 +210,80 @@ def _get_jieba():
     return _jieba
 
 
-def _extract_key_terms(content: str) -> list[str]:
-    """Extract key terms from content for knowledge graph nodes.
-
-    Strategy:
-    1. Try jieba for Chinese NLP (noun phrase extraction)
-    2. Fallback to regex if jieba unavailable
-    3. English: extract capitalized words and technical terms
-    Returns up to 15 unique key terms.
-    """
+def _extract_key_terms_with_jieba(content: str) -> set[str]:
+    """使用 jieba 提取关键字"""
     terms = set()
     
-    # 尝试使用 jieba 分词
     pseg = _get_jieba()
-    
-    if pseg and pseg is not False:
-        # 使用 jieba 词性标注提取名词短语
-        words = pseg.cut(content)
-        for word, flag in words:
-            word = word.strip()
-            if len(word) < 2:
-                continue
-            # 保留名词、动词、英文、以及自定义词汇（词性为 x 表示非语素字，通常是自定义词）
-            if flag.startswith(('n', 'v', 'eng')) or flag == 'x' or word in _CUSTOM_WORDS:
-                if word not in _STOP_WORDS:
-                    # 英文保持原样，中文直接添加
-                    if re.match(r'^[A-Za-z]', word):
-                        terms.add(word if word[0].isupper() else word.lower())
-                    else:
-                        terms.add(word)
-    else:
-        # 回退方案：正则提取
-        # Chinese: extract sequences of 2-4 Chinese characters
+    if not pseg or pseg is False:
+        # 回退到正则
         cn_matches = re.findall(r'[\u4e00-\u9fff]{2,4}', content)
         for m in cn_matches:
             if m not in _STOP_WORDS and len(m) >= 2:
                 terms.add(m)
+        return terms
     
-    # English: extract words 3+ chars, prefer capitalized and technical terms
+    # 使用 jieba 词性标注提取名词短语
+    words = pseg.cut(content)
+    for word, flag in words:
+        word = word.strip()
+        if len(word) < 2:
+            continue
+        # 保留名词、动词、英文、以及自定义词汇（词性为 x 表示非语素字，通常是自定义词）
+        if flag.startswith(('n', 'v', 'eng')) or flag == 'x' or word in _CUSTOM_WORDS:
+            if word not in _STOP_WORDS:
+                # 英文保持原样，中文直接添加
+                if re.match(r'^[A-Za-z]', word):
+                    terms.add(word if word[0].isupper() else word.lower())
+                else:
+                    terms.add(word)
+    
+    return terms
+
+
+def _extract_key_terms(content: str) -> list[str]:
+    """Extract key terms from content for knowledge graph nodes.
+
+    Strategy (priority order):
+    1. Try LLM for high-quality extraction (async, requires API key)
+    2. Fallback to jieba for Chinese NLP
+    3. Final fallback to regex
+    Returns up to 15 unique key terms.
+    """
+    terms = set()
+    
+    # 尝试使用 LLM 提取（同步调用，因为这是在数据库操作中）
+    try:
+        from memory_gateway.utils.llm_extract import extract_keywords_with_llm, get_cached_keywords, cache_keywords
+        import asyncio
+        
+        # 检查缓存
+        cached = get_cached_keywords(content)
+        if cached:
+            log.debug(f"Using cached LLM keywords for: {content[:50]}...")
+            return cached[:15]
+        
+        # 尝试调用 LLM
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # 如果事件循环正在运行，使用 jieba 回退
+            log.debug("Event loop running, falling back to jieba")
+            terms = _extract_key_terms_with_jieba(content)
+        else:
+            # 调用 LLM
+            llm_terms = loop.run_until_complete(extract_keywords_with_llm(content))
+            if llm_terms:
+                log.info(f"LLM extracted {len(llm_terms)} terms from: {content[:50]}...")
+                cache_keywords(content, llm_terms)
+                return llm_terms[:15]
+            else:
+                log.debug("LLM extraction failed, falling back to jieba")
+                terms = _extract_key_terms_with_jieba(content)
+    except Exception as e:
+        log.debug(f"LLM extraction error: {e}, falling back to jieba")
+        terms = _extract_key_terms_with_jieba(content)
+    
+    # 英文提取（无论是否使用 LLM，都补充英文术语）
     en_matches = re.findall(r'[A-Za-z_][A-Za-z0-9_]{2,}', content)
     for m in en_matches:
         lower = m.lower()
