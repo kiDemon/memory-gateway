@@ -269,10 +269,10 @@ def _extract_key_terms(content: str) -> list[str]:
             cache_keywords(content, llm_terms)
             return llm_terms[:15]
         else:
-            log.debug("LLM extraction failed or unavailable, falling back to jieba")
+            log.warning(f"LLM extraction returned None for: {content[:50]}..., falling back to jieba")
             terms = _extract_key_terms_with_jieba(content)
     except Exception as e:
-        log.debug(f"LLM extraction error: {e}, falling back to jieba")
+        log.warning(f"LLM extraction error: {e}, falling back to jieba", exc_info=True)
         terms = _extract_key_terms_with_jieba(content)
     
     # 英文提取（无论是否使用 LLM，都补充英文术语）
