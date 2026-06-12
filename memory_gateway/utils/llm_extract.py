@@ -4,6 +4,7 @@ LLM-based keyword extraction for knowledge graph.
 Supports:
 - OpenAI API (GPT-4, GPT-3.5-turbo)
 - Claude API (Claude-3, Claude-2)
+- DeepSeek API (兼容 OpenAI 格式)
 - Fallback to jieba if LLM unavailable
 """
 
@@ -46,8 +47,8 @@ Text:
 Return ONLY a JSON array of strings, no other text."""
 
 
-async def extract_keywords_with_llm(content: str) -> Optional[list[str]]:
-    """Extract keywords using LLM API.
+def extract_keywords_with_llm_sync(content: str) -> Optional[list[str]]:
+    """Extract keywords using LLM API (同步版本).
     
     Returns:
         List of keywords, or None if LLM unavailable
@@ -61,9 +62,9 @@ async def extract_keywords_with_llm(content: str) -> Optional[list[str]]:
     
     try:
         if provider == "openai":
-            return await _extract_with_openai(content, model)
+            return _extract_with_openai_sync(content, model)
         elif provider == "claude":
-            return await _extract_with_claude(content, model)
+            return _extract_with_claude_sync(content, model)
         else:
             log.warning(f"Unknown LLM provider: {provider}")
             return None
@@ -72,8 +73,8 @@ async def extract_keywords_with_llm(content: str) -> Optional[list[str]]:
         return None
 
 
-async def _extract_with_openai(content: str, model: str) -> Optional[list[str]]:
-    """Extract keywords using OpenAI API."""
+def _extract_with_openai_sync(content: str, model: str) -> Optional[list[str]]:
+    """Extract keywords using OpenAI API (同步)."""
     base_url = LLM_BASE_URL or "https://api.openai.com/v1"
     url = f"{base_url}/chat/completions"
     
@@ -92,8 +93,8 @@ async def _extract_with_openai(content: str, model: str) -> Optional[list[str]]:
         "max_tokens": 200,
     }
     
-    async with httpx.AsyncClient(timeout=LLM_TIMEOUT) as client:
-        response = await client.post(url, json=payload, headers=headers)
+    with httpx.Client(timeout=LLM_TIMEOUT) as client:
+        response = client.post(url, json=payload, headers=headers)
         response.raise_for_status()
         
         data = response.json()
@@ -103,8 +104,8 @@ async def _extract_with_openai(content: str, model: str) -> Optional[list[str]]:
         return _parse_json_array(text)
 
 
-async def _extract_with_claude(content: str, model: str) -> Optional[list[str]]:
-    """Extract keywords using Claude API."""
+def _extract_with_claude_sync(content: str, model: str) -> Optional[list[str]]:
+    """Extract keywords using Claude API (同步)."""
     base_url = LLM_BASE_URL or "https://api.anthropic.com"
     url = f"{base_url}/v1/messages"
     
@@ -122,8 +123,8 @@ async def _extract_with_claude(content: str, model: str) -> Optional[list[str]]:
         ],
     }
     
-    async with httpx.AsyncClient(timeout=LLM_TIMEOUT) as client:
-        response = await client.post(url, json=payload, headers=headers)
+    with httpx.Client(timeout=LLM_TIMEOUT) as client:
+        response = client.post(url, json=payload, headers=headers)
         response.raise_for_status()
         
         data = response.json()

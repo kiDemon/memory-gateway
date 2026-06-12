@@ -245,17 +245,16 @@ def _extract_key_terms(content: str) -> list[str]:
     """Extract key terms from content for knowledge graph nodes.
 
     Strategy (priority order):
-    1. Try LLM for high-quality extraction (async, requires API key)
+    1. Try LLM for high-quality extraction (sync, requires API key)
     2. Fallback to jieba for Chinese NLP
     3. Final fallback to regex
     Returns up to 15 unique key terms.
     """
     terms = set()
     
-    # 尝试使用 LLM 提取（同步调用，因为这是在数据库操作中）
+    # 尝试使用 LLM 提取（同步调用）
     try:
-        from memory_gateway.utils.llm_extract import extract_keywords_with_llm, get_cached_keywords, cache_keywords
-        import asyncio
+        from memory_gateway.utils.llm_extract import extract_keywords_with_llm_sync, get_cached_keywords, cache_keywords
         
         # 检查缓存
         cached = get_cached_keywords(content)
@@ -263,22 +262,15 @@ def _extract_key_terms(content: str) -> list[str]:
             log.debug(f"Using cached LLM keywords for: {content[:50]}...")
             return cached[:15]
         
-        # 尝试调用 LLM
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            # 如果事件循环正在运行，使用 jieba 回退
-            log.debug("Event loop running, falling back to jieba")
-            terms = _extract_key_terms_with_jieba(content)
+        # 调用 LLM（同步）
+        llm_terms = extract_keywords_with_llm_sync(content)
+        if llm_terms:
+            log.info(f"LLM extracted {len(llm_terms)} terms from: {content[:50]}...")
+            cache_keywords(content, llm_terms)
+            return llm_terms[:15]
         else:
-            # 调用 LLM
-            llm_terms = loop.run_until_complete(extract_keywords_with_llm(content))
-            if llm_terms:
-                log.info(f"LLM extracted {len(llm_terms)} terms from: {content[:50]}...")
-                cache_keywords(content, llm_terms)
-                return llm_terms[:15]
-            else:
-                log.debug("LLM extraction failed, falling back to jieba")
-                terms = _extract_key_terms_with_jieba(content)
+            log.debug("LLM extraction failed or unavailable, falling back to jieba")
+            terms = _extract_key_terms_with_jieba(content)
     except Exception as e:
         log.debug(f"LLM extraction error: {e}, falling back to jieba")
         terms = _extract_key_terms_with_jieba(content)
