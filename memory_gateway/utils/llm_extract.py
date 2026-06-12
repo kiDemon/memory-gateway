@@ -74,7 +74,11 @@ def extract_keywords_with_llm_sync(content: str) -> Optional[list[str]]:
 
 
 def _extract_with_openai_sync(content: str, model: str) -> Optional[list[str]]:
-    """Extract keywords using OpenAI API (同步)."""
+    """Extract keywords using OpenAI API (同步).
+    
+    支持 DeepSeek 等兼容 OpenAI 格式的 API。
+    DeepSeek 的 reasoning 模型会在 reasoning_content 字段返回推理过程。
+    """
     base_url = LLM_BASE_URL or "https://api.openai.com/v1"
     url = f"{base_url}/chat/completions"
     
@@ -86,11 +90,11 @@ def _extract_with_openai_sync(content: str, model: str) -> Optional[list[str]]:
     payload = {
         "model": model,
         "messages": [
-            {"role": "system", "content": "You are a keyword extraction assistant."},
+            {"role": "system", "content": "You are a keyword extraction assistant. Return ONLY a JSON array of strings."},
             {"role": "user", "content": _KEYWORD_EXTRACTION_PROMPT.format(text=content)},
         ],
         "temperature": 0.1,
-        "max_tokens": 200,
+        "max_tokens": 500,  # DeepSeek reasoning 需要更多 tokens
     }
     
     with httpx.Client(timeout=LLM_TIMEOUT) as client:
@@ -98,7 +102,19 @@ def _extract_with_openai_sync(content: str, model: str) -> Optional[list[str]]:
         response.raise_for_status()
         
         data = response.json()
-        text = data["choices"][0]["message"]["content"].strip()
+        choice = data["choices"][0]
+        message = choice["message"]
+        
+        # 优先使用 content，如果为空则尝试 reasoning_content（DeepSeek 特有）
+        text = message.get("content", "").strip()
+        if not text:
+            text = message.get("reasoning_content", "").strip()
+            if text:
+                log.debug("Using reasoning_content from DeepSeek model")
+        
+        if not text:
+            log.warning("LLM returned empty content and reasoning_content")
+            return None
         
         # Parse JSON array
         return _parse_json_array(text)
