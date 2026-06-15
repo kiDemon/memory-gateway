@@ -145,9 +145,7 @@ async def get_apikey_info() -> dict:
     return {
         "masked": masked,
         "length": len(key),
-        "source": "environment" if os.environ.get("MEMORY_API_KEY", "").strip() else (
-            "file" if KEY_FILE.exists() else "auto-generated"
-        ),
+        "source": "file" if KEY_FILE.exists() else "auto-generated",
     }
 
 
@@ -155,21 +153,15 @@ async def get_apikey_info() -> dict:
 async def rotate_apikey(request: Request) -> dict:
     """Generate a new API key, persist to file, and update runtime.
 
-    The old key is immediately invalidated.
-    Environment variable key cannot be rotated — set MEMORY_API_KEY to empty first.
+    The old key is immediately invalidated. Always writes to /data/.api_key.
     """
     origin = request.headers.get("Origin", "")
     referer = request.headers.get("Referer", "")
     if not _is_same_origin(request, origin or referer):
         raise HTTPException(status_code=403, detail="CSRF check failed")
 
-    if os.environ.get("MEMORY_API_KEY", "").strip():
-        raise HTTPException(
-            status_code=400,
-            detail="Cannot rotate key set via MEMORY_API_KEY env var. Unset the env var and restart, then rotate."
-        )
-
     new_key = _generate_api_key()
+    KEY_FILE.parent.mkdir(parents=True, exist_ok=True)
     KEY_FILE.write_text(new_key)
     try:
         os.chmod(KEY_FILE, 0o600)
@@ -189,15 +181,10 @@ async def reset_apikey(request: Request) -> dict:
     if not _is_same_origin(request, origin or referer):
         raise HTTPException(status_code=403, detail="CSRF check failed")
 
-    if os.environ.get("MEMORY_API_KEY", "").strip():
-        raise HTTPException(
-            status_code=400,
-            detail="Cannot reset key set via MEMORY_API_KEY env var. Unset the env var and restart."
-        )
-
     if KEY_FILE.exists():
         KEY_FILE.unlink()
     new_key = _generate_api_key()
+    KEY_FILE.parent.mkdir(parents=True, exist_ok=True)
     KEY_FILE.write_text(new_key)
     try:
         os.chmod(KEY_FILE, 0o600)
@@ -217,13 +204,8 @@ async def set_apikey(req: SetKeyRequest, request: Request) -> dict:
     if not _is_same_origin(request, origin or referer):
         raise HTTPException(status_code=403, detail="CSRF check failed")
 
-    if os.environ.get("MEMORY_API_KEY", "").strip():
-        raise HTTPException(
-            status_code=400,
-            detail="Cannot override key set via MEMORY_API_KEY env var."
-        )
-
     new_key = req.key.strip()
+    KEY_FILE.parent.mkdir(parents=True, exist_ok=True)
     KEY_FILE.write_text(new_key)
     try:
         os.chmod(KEY_FILE, 0o600)
@@ -246,9 +228,7 @@ async def settings_apikey_info() -> dict:
     return {
         "masked": masked,
         "length": len(key),
-        "source": "environment" if os.environ.get("MEMORY_API_KEY", "").strip() else (
-            "file" if KEY_FILE.exists() else "auto-generated"
-        ),
+        "source": "file" if KEY_FILE.exists() else "auto-generated",
     }
 
 
@@ -260,13 +240,8 @@ async def settings_apikey_rotate(request: Request) -> dict:
     if not _is_same_origin(request, origin or referer):
         raise HTTPException(status_code=403, detail="CSRF check failed")
 
-    if os.environ.get("MEMORY_API_KEY", "").strip():
-        raise HTTPException(
-            status_code=400,
-            detail="Cannot rotate key set via MEMORY_API_KEY env var."
-        )
-
     new_key = _generate_api_key()
+    KEY_FILE.parent.mkdir(parents=True, exist_ok=True)
     KEY_FILE.write_text(new_key)
     try:
         os.chmod(KEY_FILE, 0o600)
@@ -286,13 +261,8 @@ async def settings_apikey_set(req: SetKeyRequest, request: Request) -> dict:
     if not _is_same_origin(request, origin or referer):
         raise HTTPException(status_code=403, detail="CSRF check failed")
 
-    if os.environ.get("MEMORY_API_KEY", "").strip():
-        raise HTTPException(
-            status_code=400,
-            detail="Cannot override key set via MEMORY_API_KEY env var."
-        )
-
     new_key = req.key.strip()
+    KEY_FILE.parent.mkdir(parents=True, exist_ok=True)
     KEY_FILE.write_text(new_key)
     try:
         os.chmod(KEY_FILE, 0o600)

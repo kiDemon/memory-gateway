@@ -705,31 +705,40 @@ app.add_middleware(
 # (_generate_api_key moved to memory_gateway/utils/helpers.py)
 
 def _load_api_key() -> str:
-    """Load API key: env var > file > auto-generate and persist.
+    """Load API key: file is the single source of truth.
 
-    Priority:
-    1. MEMORY_API_KEY environment variable (highest)
-    2. /data/.api_key file on disk
-    3. Auto-generate, save to file, print to log (bootstrapping)
+    Design:
+    - /data/.api_key file is the ONLY authoritative key store
+    - MEMORY_API_KEY env var is used ONLY for first-time initialization
+      (if env var set AND file doesn't exist → write env var to file)
+    - rotate/reset/set endpoints always write to file
+    - If nothing exists → auto-generate, write to file
+
+    This eliminates the dual-source problem where env var and file
+    could hold different keys, causing intermittent 401 errors.
     """
-    # 1. Environment variable (explicit override)
+    # 1. First-time bootstrap: seed file from env var (one-way, non-destructive)
     env_key = os.environ.get("MEMORY_API_KEY", "").strip()
-    if env_key:
-        log.info("Using API key from MEMORY_API_KEY environment variable")
-        return env_key
+    if env_key and not KEY_FILE.exists():
+        KEY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        KEY_FILE.write_text(env_key)
+        try:
+            os.chmod(KEY_FILE, 0o600)
+        except Exception:
+            pass
+        log.info("Seeded API key from MEMORY_API_KEY env var → %s", KEY_FILE)
 
-    # 2. Persistent key file (survives restarts)
+    # 2. Read from file (single source of truth)
     if KEY_FILE.exists():
         file_key = KEY_FILE.read_text().strip()
         if file_key:
             log.info("Using API key from %s (hash: %s)", KEY_FILE, hashlib.sha256(file_key.encode()).hexdigest()[:12])
             return file_key
 
-    # 3. Auto-generate (first run / bootstrap)
+    # 3. Auto-generate (first run, no env var, no file)
     new_key = _generate_api_key()
     KEY_FILE.parent.mkdir(parents=True, exist_ok=True)
     KEY_FILE.write_text(new_key)
-    # Restrict permissions so only the server user can read it
     try:
         os.chmod(KEY_FILE, 0o600)
     except Exception:
