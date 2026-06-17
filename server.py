@@ -818,6 +818,10 @@ app.include_router(memories_router)
 app.include_router(categories_router)
 app.include_router(mcp_router)
 
+# ── Enhancement Router (借鉴左脑理念) ─────────────────
+from memory_gateway.enhancement import enhancement_router
+app.include_router(enhancement_router)
+
 
 # ── Run ──────────────────────────────────────────────────
 
