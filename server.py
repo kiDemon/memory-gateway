@@ -666,7 +666,7 @@ def row_to_dict(row: sqlite3.Row) -> dict:
 
 # ── FastAPI App ──────────────────────────────────────────
 
-APP_VERSION = "5.1.1"
+APP_VERSION = "5.2.0"
 
 app = FastAPI(
     title="Memory Gateway",

@@ -125,7 +125,7 @@ async def save_memory(req: SaveRequest) -> dict:
             DEFAULT_TTL.get(mem_type) or DEFAULT_TTL.get(req.priority or "P1", 0),
             init_clock,
             now, now, checksum, simhash,
-            derived_from_json, req.superseded_by),
+            derived_from_json, None),  # superseded_by 不写在新条上；旧条 archive 时由收敛段写回
         )
 
         VersionManager.create_version(
@@ -142,6 +142,29 @@ async def save_memory(req: SaveRequest) -> dict:
                 (req.session_id, memory_id, now),
             )
 
+        # 写入侧收敛：调用方传入 supersedes=旧条 ID 时（新条取代旧条），
+        # 把旧条 archive + 把 superseded_by 字段（新条ID）写回旧条，
+        # 这样旧条默认从 search/list 中排除，而追溯链仍可读（mem_get 可见）。
+        if req.superseded_by:
+            old = db.execute(
+                "SELECT id, archived FROM memories WHERE id=?",
+                (req.superseded_by,),
+            ).fetchone()
+            if old and old["archived"] == 0:
+                db.execute(
+                    "UPDATE memories SET archived=1, superseded_by=?, updated_at=? WHERE id=?",
+                    (memory_id, now, req.superseded_by),
+                )
+                db.execute(
+                    "INSERT INTO change_log (memory_id, action, snapshot, timestamp) "
+                    "VALUES (?, 'archived_by_supersede', ?, ?)",
+                    (req.superseded_by, f"superseded_by={memory_id}", now),
+                )
+                log.info(
+                    "save_memory: archived %s (superseded_by=%s)",
+                    req.superseded_by[:8], memory_id[:8],
+                )
+
         db.execute(
             "INSERT INTO change_log (memory_id, action, snapshot, timestamp) VALUES (?, 'save', ?, ?)",
             (memory_id, content, now),
@@ -151,7 +174,14 @@ async def save_memory(req: SaveRequest) -> dict:
         _sync_hot_tier_from_cache(db)
         hot_cache.clear()  # 新写入后立即失效搜索缓存
 
-    return {"success": True, "action": "saved", "id": memory_id, "type": mem_type, "graph_edges": graph_edges}
+    return {
+        "success": True,
+        "action": "saved",
+        "id": memory_id,
+        "type": mem_type,
+        "graph_edges": graph_edges,
+        "archived_superseded": req.superseded_by if req.superseded_by else None,
+    }
 
 
 # ── Context Offload & 4-Layer Storage ────────────────────
@@ -274,11 +304,14 @@ async def search_memory(req: SearchRequest) -> dict:
 
         safe_q = req.q.replace('"', '""')
 
-        conditions = ["m.archived=0"]
+        # 收敛后默认语义：archived=0 且未被 supersede 的记忆才是"当前生效"。
+        # 调用方显式 include_archived=True 时切换到全量视图（含 archive + superseded）。
+        conditions = ["m.archived=0", "(m.superseded_by IS NULL OR m.superseded_by='')"]
         params: list[Any] = []
 
         if req.include_archived:
             conditions[0] = "1=1"
+            conditions[1] = "1=1"
 
         if req.category_filter:
             if req.category_filter == "work":
@@ -459,11 +492,12 @@ async def search_memory(req: SearchRequest) -> dict:
 @router.post("/mcp/list")
 async def list_memory(req: ListRequest) -> dict:
     with db_conn() as db:
-        conditions = []
+        conditions = ["archived=0", "(superseded_by IS NULL OR superseded_by='')"]
         params: list[Any] = []
 
-        if not req.include_archived:
-            conditions.append("archived=0")
+        if req.include_archived:
+            conditions[0] = "1=1"
+            conditions[1] = "1=1"
 
         if req.since:
             conditions.append("created_at >= ?")
@@ -546,8 +580,12 @@ async def search_hybrid(req: SearchHybridRequest) -> dict:
     t_start = time.time()
     with db_conn() as db:
         safe_q = req.q.replace('"', '""')
-        conditions = ["m.archived=0"]
+        conditions = ["m.archived=0", "(m.superseded_by IS NULL OR m.superseded_by='')"]
         params: list[Any] = []
+
+        if req.include_archived:
+            conditions[0] = "1=1"
+            conditions[1] = "1=1"
 
         if req.category_filter:
             conditions.append("m.category_id=?")
@@ -790,7 +828,8 @@ async def delete_memory(memory_id: str) -> dict:
 @router.get("/mcp/export")
 async def export_memories(scope: Optional[str] = None, source: Optional[str] = None) -> dict:
     with db_conn() as db:
-        conditions = ["archived=0"]
+        # export 默认与 search/list 保持一致：当前生效层（不包含已 superseded 的活跃条）
+        conditions = ["archived=0", "(superseded_by IS NULL OR superseded_by='')"]
         params: list[Any] = []
         if scope:
             conditions.append("scope=?")
@@ -1166,12 +1205,24 @@ async def lint_memories() -> dict:
         # Get all non-archived memories
         rows = db.execute(
             "SELECT id, content, source, priority, confidence, tags, created_at, "
-            "last_recalled, recall_count, archived "
+            "last_recalled, recall_count, archived, superseded_by "
             "FROM memories WHERE archived=0"
         ).fetchall()
 
         total_checked = len(rows)
         log.info(f"mem_lint: scanning {total_checked} active memories")
+
+        # ── 0. superseded_but_active (收敛遗留脏数据) ──
+        superseded_active_rows = db.execute(
+            "SELECT id, content, superseded_by FROM memories "
+            "WHERE archived=0 AND superseded_by IS NOT NULL AND superseded_by != ''"
+        ).fetchall()
+        for r in superseded_active_rows:
+            issues.setdefault("superseded_but_active", []).append({
+                "id": r["id"],
+                "superseded_by": r["superseded_by"],
+                "content_preview": r["content"][:120],
+            })
 
         # ── 2. Stale (archived=0, priority!=P0, last_recalled=NULL, created > 90d) ──
         stale_cutoff = now - timedelta(days=90)

@@ -20,7 +20,7 @@ class SaveRequest(BaseModel):
     session_id: Optional[str] = None
     id: Optional[str] = None
     derived_from: Optional[list[str]] = Field(default=None, description="来源记忆ID列表（进化产物血缘）")
-    superseded_by: Optional[str] = Field(default=None, description="被哪条记忆取代（指向新记忆ID）")
+    superseded_by: Optional[str] = Field(default=None, description="（写入收敛）本条取代的旧条 ID。写入时旧条会被自动 archive，并将其 superseded_by 字段设为新条 ID")
     insights: Optional[str] = Field(default=None, max_length=5000, description="提炼结论：从这条记忆学到了什么")
 
 

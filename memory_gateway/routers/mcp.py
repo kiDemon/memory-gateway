@@ -72,7 +72,7 @@ router = APIRouter(tags=["mcp"])
 MCP_TOOLS = [
     {
         "name": "mem_save",
-        "description": "保存一条记忆到记忆库。支持分类、优先级、标签等元数据。支持血缘追踪(derived_from)和替代关系(superseded_by)。",
+        "description": "保存一条记忆到记忆库。支持分类、优先级、标签等元数据。支持血缘追踪(derived_from)和替代关系(superseded_by)。写入收敛：传入 superseded_by 时，会自动把被指向的旧条 archive（旧条默认从 search/list 中排除）。",
         "inputSchema": {
             "type": "object",
             "properties": {
