@@ -312,6 +312,18 @@ def api_backlinks(path: str = Query(...)):
 @router.get("/page", response_class=HTMLResponse)
 def page(path: str = Query("")):
     """渲染单个 markdown 为完整 HTML（服务端）。"""
+    # vault 缺失时友好提示
+    if not VAULT.exists() or not VAULT.is_dir():
+        return HTMLResponse(
+            f"""<!doctype html><html><head><meta charset=utf-8><title>vault · 配置缺失</title>
+            <link rel="stylesheet" href="/static/vault.css"></head>
+            <body><div style="max-width:560px;margin:80px auto">
+            <h1>📚 vault 路径未配置</h1>
+            <p>当前 OBSIDIAN_VAULT_PATH = <code>{VAULT}</code></p>
+            <p>请配置真源后重启容器。</p>
+            </div></body></html>""",
+            status_code=503,
+        )
     p = _safe_resolve(path)
     if not p or not p.exists():
         # 不存在 → 返回提示页（200，不报错）
@@ -396,9 +408,38 @@ fetch('/vault/api/backlinks?path=' + encodeURIComponent(PATH))
 @router.get("/", response_class=HTMLResponse)
 def index(dir: str = Query("")):
     """vault 首页：左侧树 + 当前目录文件列表。"""
+    # vault 根缺失 → 给运维友好提示而不是 500
+    if not VAULT.exists() or not VAULT.is_dir():
+        return HTMLResponse(
+            f"""<!doctype html><html><head><meta charset=utf-8><title>vault · 配置缺失</title>
+            <link rel="stylesheet" href="/static/vault.css"></head>
+            <body><div style="max-width:560px;margin:80px auto;padding:0 24px">
+            <h1>📚 vault 路径未配置</h1>
+            <p>环境变量 <code>OBSIDIAN_VAULT_PATH</code> 指向的目录不存在：</p>
+            <pre style="background:#1a1a1a;padding:12px;border-radius:4px;overflow-x:auto"><code>{VAULT}</code></pre>
+            <p>请在服务器侧：</p>
+            <ol>
+              <li>建目录：<code>mkdir -p /data/memory-gateway/vault</code></li>
+              <li>同步 vault 真源到这个目录（rsync / OSS / git）</li>
+              <li>改 <code>.env</code> 设置 <code>OBSIDIAN_VAULT_PATH=/data/memory-gateway/vault</code></li>
+              <li>重启容器：<code>docker compose restart</code></li>
+            </ol>
+            <p>详见：<a href="/vault/health">/vault/health</a> 看实时状态。</p>
+            </div></body></html>""",
+            status_code=503,
+        )
     p = _safe_resolve(dir)
     if not p or not p.exists():
-        return HTMLResponse("<h1>vault 根不存在</h1>", status_code=500)
+        return HTMLResponse(
+            f"""<!doctype html><html><head><meta charset=utf-8><title>vault · 目录不存在</title>
+            <link rel="stylesheet" href="/static/vault.css"></head>
+            <body><div style="max-width:560px;margin:80px auto">
+            <h1>📂 目录不存在</h1>
+            <p>路径：<code>{dir}</code></p>
+            <p><a href="/vault/">← 返回 vault 首页</a></p>
+            </div></body></html>""",
+            status_code=404,
+        )
     if not p.is_dir():
         return RedirectResponse(url=f"/vault/page?path={dir}", status_code=302)
 
