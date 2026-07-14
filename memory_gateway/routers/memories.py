@@ -291,7 +291,7 @@ def _escape_like(s: str) -> str:
 async def search_memory(req: SearchRequest) -> dict:
     t_start = time.time()
     with db_conn() as db:
-        cache_key = f"search:{req.q}:{req.category_filter}:{req.type_filter}:{req.source_filter}:{req.limit}"
+        cache_key = f"search:{req.q}:{req.category_filter}:{req.type_filter}:{req.source_filter}:{req.limit}:{req.include_archived}"
         cached = hot_cache.get(cache_key)
         if cached:
             return {
