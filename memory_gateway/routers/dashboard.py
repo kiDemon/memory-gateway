@@ -109,50 +109,104 @@ async def dashboard_memories(
     source: Optional[str] = None,
     priority: Optional[str] = None,
 ):
-    """Return paginated memory list with optional filters."""
+    """Return paginated memory list with optional filters.
+
+    普通关键词优先走 FTS5；UUID 精确 id 查询；FTS 失败回退 LIKE。
+    """
+    import re
+
     # 限制 page_size 上界，防止全表扫描
     page_size = min(max(page_size, 1), 200)
     page = max(page, 1)
     offset = (max(1, page) - 1) * page_size
-    conditions = ["archived=0"]
+    conditions = ["m.archived=0"]
     params: list[Any] = []
+    join_fts = ""
+    order_by = "m.updated_at DESC"
 
     if q:
-        # 检查是否为 UUID 格式的 ID
-        import re
+        q_stripped = q.strip()
         uuid_pattern = r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
-        if re.match(uuid_pattern, q.strip(), re.IGNORECASE):
-            # 直接用 ID 查询
-            conditions.append("id=?")
-            params.append(q.strip())
+        if re.match(uuid_pattern, q_stripped, re.IGNORECASE):
+            conditions.append("m.id=?")
+            params.append(q_stripped)
         else:
-            # 普通内容搜索
-            conditions.append("content LIKE ?")
-            params.append(f"%{q}%")
+            # FTS5 安全转义：双引号包裹 + 前缀匹配
+            safe = q_stripped.replace('"', '""')
+            fts_query = f'"{safe}"*' if len(safe) >= 2 else f'"{safe}"'
+            join_fts = "JOIN memories_fts fts ON fts.rowid = m.rowid"
+            conditions.append("fts MATCH ?")
+            params.append(fts_query)
+            order_by = "bm25(fts) ASC, m.updated_at DESC"
     if category:
-        conditions.append("category_id=?")
+        conditions.append("m.category_id=?")
         params.append(category)
     if source:
-        conditions.append("source=?")
+        conditions.append("m.source=?")
         params.append(source)
     if priority:
-        conditions.append("priority=?")
+        conditions.append("m.priority=?")
         params.append(priority)
 
     where = " AND ".join(conditions)
+    select_cols = (
+        "m.id, m.content, m.category_id, m.type, m.source, m.priority, m.scope, m.tags, "
+        "m.created_at, m.updated_at"
+    )
 
     with db_conn() as db:
-        total = db.execute(f"SELECT COUNT(*) FROM memories WHERE {where}", params).fetchone()[0]
-        rows = db.execute(
-            f"SELECT id, content, category_id, type, source, priority, scope, tags, "
-            f"created_at, updated_at FROM memories WHERE {where} "
-            f"ORDER BY updated_at DESC LIMIT ? OFFSET ?",
-            params + [page_size, offset],
-        ).fetchall()
+        try:
+            total = db.execute(
+                f"SELECT COUNT(*) FROM memories m {join_fts} WHERE {where}",
+                params,
+            ).fetchone()[0]
+            rows = db.execute(
+                f"SELECT {select_cols} FROM memories m {join_fts} WHERE {where} "
+                f"ORDER BY {order_by} LIMIT ? OFFSET ?",
+                params + [page_size, offset],
+            ).fetchall()
+        except Exception as e:
+            # FTS 不可用或语法失败 → 回退 LIKE（不带 fts join）
+            log.warning("dashboard FTS search failed, fallback LIKE: %s", e)
+            conditions = ["archived=0"]
+            params = []
+            if q:
+                q_stripped = q.strip()
+                uuid_pattern = r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+                if re.match(uuid_pattern, q_stripped, re.IGNORECASE):
+                    conditions.append("id=?")
+                    params.append(q_stripped)
+                else:
+                    conditions.append("content LIKE ?")
+                    params.append(f"%{q_stripped}%")
+            if category:
+                conditions.append("category_id=?")
+                params.append(category)
+            if source:
+                conditions.append("source=?")
+                params.append(source)
+            if priority:
+                conditions.append("priority=?")
+                params.append(priority)
+            where = " AND ".join(conditions)
+            total = db.execute(f"SELECT COUNT(*) FROM memories WHERE {where}", params).fetchone()[0]
+            rows = db.execute(
+                f"SELECT id, content, category_id, type, source, priority, scope, tags, "
+                f"created_at, updated_at FROM memories WHERE {where} "
+                f"ORDER BY updated_at DESC LIMIT ? OFFSET ?",
+                params + [page_size, offset],
+            ).fetchall()
+
+    items = []
+    for r in rows:
+        d = dict(r)
+        if "category_id" in d and "category" not in d:
+            d["category"] = d["category_id"]
+        items.append(d)
 
     total_pages = max(1, (total + page_size - 1) // page_size)
     return {
-        "items": [dict(r) for r in rows],
+        "items": items,
         "total": total,
         "page": page,
         "page_size": page_size,
@@ -222,9 +276,9 @@ async def dashboard_graph(limit: int = 200):
     """Return knowledge graph data for D3.js visualization.
 
     Returns nodes (terms) and edges (relations) suitable for a force-directed graph.
+    Degree 用单次 GROUP BY 聚合，避免 N+1。
     """
     with db_conn() as db:
-        # Get edges from memory_relations
         rows = db.execute(
             """SELECT source_id, target_id, relation, strength
                FROM memory_relations
@@ -233,24 +287,25 @@ async def dashboard_graph(limit: int = 200):
         ).fetchall()
         edges = [dict(r) for r in rows]
 
-        # Collect unique node IDs
         node_ids = set()
         for e in edges:
             node_ids.add(e["source_id"])
             node_ids.add(e["target_id"])
 
-        # For each term, count how many memories reference it
-        nodes = []
-        for term in node_ids:
-            # Count co-occurrence degree (both directions)
-            degree = db.execute(
-                """SELECT COUNT(*) FROM memory_relations
-                   WHERE source_id=? OR target_id=?""",
-                (term, term),
-            ).fetchone()[0]
-            nodes.append({"id": term, "degree": degree})
+        # 一次聚合拿 degree（两端都算）
+        degree_map: dict[str, int] = {}
+        if node_ids:
+            for row in db.execute(
+                """SELECT term, COUNT(*) AS cnt FROM (
+                       SELECT source_id AS term FROM memory_relations
+                       UNION ALL
+                       SELECT target_id AS term FROM memory_relations
+                   ) GROUP BY term"""
+            ):
+                if row["term"] in node_ids:
+                    degree_map[row["term"]] = row["cnt"]
 
-        # Graph stats
+        nodes = [{"id": term, "degree": degree_map.get(term, 0)} for term in node_ids]
         total_edges = db.execute("SELECT COUNT(*) FROM memory_relations").fetchone()[0]
         total_terms = len(node_ids)
 

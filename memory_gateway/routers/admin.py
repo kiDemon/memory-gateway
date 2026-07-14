@@ -21,6 +21,7 @@ from memory_gateway.middleware import (
     COOKIE_NAME,
     LOCKOUT_DURATION,
     SESSION_DURATION,
+    _clear_all_sessions,
     _clear_failures,
     _create_session,
     _delete_session,
@@ -62,7 +63,11 @@ async def admin_login(body: LoginRequest, request: Request):
             detail=f"IP 已被临时锁定，请在 {remaining} 秒后重试",
         )
 
-    if _auth_mw.API_KEY and hmac.compare_digest(body.key, _auth_mw.API_KEY):
+    if (
+        _auth_mw.API_KEY
+        and len(body.key) == len(_auth_mw.API_KEY)
+        and hmac.compare_digest(body.key, _auth_mw.API_KEY)
+    ):
         # Successful login
         _clear_failures(ip)
         token = _create_session(ip)
@@ -168,9 +173,15 @@ async def rotate_apikey(request: Request) -> dict:
     except Exception:
         log.warning("Could not set permissions on API key file (non-fatal)", exc_info=True)
     _auth_mw.API_KEY = new_key
-    log.warning("API Key rotated — new key saved to %s", KEY_FILE)
+    cleared = _clear_all_sessions()
+    log.warning("API Key rotated — new key saved to %s (sessions cleared=%s)", KEY_FILE, cleared)
     masked = new_key[:16] + "..." + new_key[-4:] if len(new_key) > 24 else "****"
-    return {"success": True, "masked": masked, "message": "Key rotated. All clients must update."}
+    return {
+        "success": True,
+        "masked": masked,
+        "sessions_cleared": cleared,
+        "message": "Key rotated. All clients must update. Existing sessions invalidated.",
+    }
 
 
 @router.post("/admin/apikey/reset")
@@ -191,9 +202,15 @@ async def reset_apikey(request: Request) -> dict:
     except Exception:
         log.warning("Could not set permissions on API key file (non-fatal)", exc_info=True)
     _auth_mw.API_KEY = new_key
-    log.warning("API Key reset — new key saved to %s", KEY_FILE)
+    cleared = _clear_all_sessions()
+    log.warning("API Key reset — new key saved to %s (sessions cleared=%s)", KEY_FILE, cleared)
     masked = new_key[:16] + "..." + new_key[-4:] if len(new_key) > 24 else "****"
-    return {"success": True, "masked": masked, "message": "Key reset and regenerated."}
+    return {
+        "success": True,
+        "masked": masked,
+        "sessions_cleared": cleared,
+        "message": "Key reset and regenerated. Existing sessions invalidated.",
+    }
 
 
 @router.post("/admin/apikey/set")
@@ -212,9 +229,15 @@ async def set_apikey(req: SetKeyRequest, request: Request) -> dict:
     except Exception:
         log.warning("Could not set permissions on API key file (non-fatal)", exc_info=True)
     _auth_mw.API_KEY = new_key
+    cleared = _clear_all_sessions()
     masked = new_key[:16] + "..." + new_key[-4:] if len(new_key) > 24 else "****"
-    log.warning("API Key manually set — saved to %s", KEY_FILE)
-    return {"success": True, "masked": masked, "message": "Custom key set."}
+    log.warning("API Key manually set — saved to %s (sessions cleared=%s)", KEY_FILE, cleared)
+    return {
+        "success": True,
+        "masked": masked,
+        "sessions_cleared": cleared,
+        "message": "Custom key set. Existing sessions invalidated.",
+    }
 
 
 # ── Settings API Routes ──────────────────────────────────
@@ -248,9 +271,18 @@ async def settings_apikey_rotate(request: Request) -> dict:
     except Exception:
         log.warning("Could not set permissions on API key file (non-fatal)", exc_info=True)
     _auth_mw.API_KEY = new_key
-    log.warning("API Key rotated via /api/settings/apikey/rotate — saved to %s", KEY_FILE)
+    cleared = _clear_all_sessions()
+    log.warning(
+        "API Key rotated via /api/settings/apikey/rotate — saved to %s (sessions cleared=%s)",
+        KEY_FILE, cleared,
+    )
     masked = new_key[:16] + "..." + new_key[-4:] if len(new_key) > 24 else "****"
-    return {"success": True, "masked": masked, "message": "Key rotated."}
+    return {
+        "success": True,
+        "masked": masked,
+        "sessions_cleared": cleared,
+        "message": "Key rotated. Existing sessions invalidated.",
+    }
 
 
 @router.post("/api/settings/apikey/set")
@@ -269,9 +301,18 @@ async def settings_apikey_set(req: SetKeyRequest, request: Request) -> dict:
     except Exception:
         log.warning("Could not set permissions on API key file (non-fatal)", exc_info=True)
     _auth_mw.API_KEY = new_key
+    cleared = _clear_all_sessions()
     masked = new_key[:16] + "..." + new_key[-4:] if len(new_key) > 24 else "****"
-    log.warning("API Key manually set via /api/settings/apikey/set — saved to %s", KEY_FILE)
-    return {"success": True, "masked": masked, "message": "Custom key set."}
+    log.warning(
+        "API Key manually set via /api/settings/apikey/set — saved to %s (sessions cleared=%s)",
+        KEY_FILE, cleared,
+    )
+    return {
+        "success": True,
+        "masked": masked,
+        "sessions_cleared": cleared,
+        "message": "Custom key set. Existing sessions invalidated.",
+    }
 
 
 @router.get("/api/settings/login-logs")

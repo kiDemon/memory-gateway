@@ -286,7 +286,14 @@ const API = '';
 let charts = {};
 let currentPage = 0;
 
-function getApiKey() { return localStorage.getItem('mg_api_key') || ''; }
+function getApiKey() {
+  // 统一 mg_api_key；兼容登录页旧 key memory_gateway_key
+  const k = localStorage.getItem('mg_api_key') || localStorage.getItem('memory_gateway_key') || '';
+  if (k && !localStorage.getItem('mg_api_key')) {
+    localStorage.setItem('mg_api_key', k);
+  }
+  return k;
+}
 
 async function fetchJSON(url) {
   try {
@@ -804,6 +811,7 @@ async function logoutUser() {
     // 忽略网络错误，仍然清除本地状态
   }
   localStorage.removeItem('mg_api_key');
+  localStorage.removeItem('memory_gateway_key');
   sessionStorage.clear();
   document.cookie = 'memory_gateway_session=; path=/; max-age=0; SameSite=Strict';
   document.getElementById('apiKeyInput').value = '';
@@ -823,7 +831,7 @@ async function initCategories() {
 }
 
 // 启动
-const savedKey = localStorage.getItem('mg_api_key');
+const savedKey = localStorage.getItem('mg_api_key') || localStorage.getItem('memory_gateway_key');
 if (savedKey) document.getElementById('apiKeyInput').value = savedKey;
 loadOverview();
 initCategories();

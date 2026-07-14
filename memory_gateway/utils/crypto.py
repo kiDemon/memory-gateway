@@ -18,15 +18,33 @@ def compute_simhash(content: str, hashbits: int = 64) -> str:
 
     SimHash produces similar hashes for similar content.
     Hamming distance < 10 means ~80%+ similarity.
+
+    Short texts (<3 tokens) fall back to unigram/bigram features so the
+    fingerprint is never the all-zero trap that caused false near-dups.
     """
     tokens = re.findall(r'[\w\u4e00-\u9fff]+', content.lower())
     if not tokens:
-        return "0" * (hashbits // 4)
-    # Use shingle of 3 tokens
+        # Empty after tokenize: hash raw stripped content to avoid all-zero collision
+        raw = (content or "").strip().lower() or "empty"
+        h = int(hashlib.md5(raw.encode()).hexdigest(), 16)
+        return format(h & ((1 << hashbits) - 1), f'0{hashbits // 4}x')
+
+    # Feature selection by length:
+    # - 1 token: unigram only
+    # - 2 tokens: unigrams + bigram
+    # - 3+ tokens: 3-token shingles (classic SimHash)
+    features: list[str] = []
+    if len(tokens) == 1:
+        features = [tokens[0]]
+    elif len(tokens) == 2:
+        features = [tokens[0], tokens[1], tokens[0] + tokens[1]]
+    else:
+        for i in range(len(tokens) - 2):
+            features.append(tokens[i] + tokens[i + 1] + tokens[i + 2])
+
     v = [0] * hashbits
-    for i in range(len(tokens) - 2):
-        shingle = tokens[i] + tokens[i+1] + tokens[i+2]
-        h = int(hashlib.md5(shingle.encode()).hexdigest(), 16)
+    for feat in features:
+        h = int(hashlib.md5(feat.encode()).hexdigest(), 16)
         for bit in range(hashbits):
             if h & (1 << bit):
                 v[bit] += 1
@@ -55,17 +73,31 @@ def _find_near_duplicate(db: sqlite3.Connection, simhash: str, threshold: int = 
 
     Returns dict with 'id', 'content', 'simhash', 'distance', 'similarity' if found, None otherwise.
     DRY helper used by mem_save, mem_batch_save, and batch_check endpoints.
+
+    Skips the all-zero fingerprint (legacy short-text trap) so old bad
+    hashes do not false-positive against each other.
     """
+    if not simhash or simhash == ("0" * len(simhash)):
+        return None
+
+    # Prefer recent rows; raise scan cap so large libraries still dedup.
     similar = db.execute(
-        "SELECT id, content, simhash FROM memories WHERE archived=0 AND simhash != '' LIMIT 1000"
+        "SELECT id, content, simhash FROM memories "
+        "WHERE archived=0 AND simhash != '' AND simhash != ? "
+        "ORDER BY created_at DESC LIMIT 5000",
+        ("0" * len(simhash),),
     ).fetchall()
     for r in similar:
-        if r["simhash"] and hamming_distance(simhash, r["simhash"]) < threshold:
+        other = r["simhash"]
+        if not other or other == ("0" * len(other)):
+            continue
+        dist = hamming_distance(simhash, other)
+        if dist < threshold:
             return {
                 "id": r["id"],
                 "content": r["content"] if "content" in r.keys() else "",
-                "simhash": r["simhash"],
-                "distance": hamming_distance(simhash, r["simhash"]),
-                "similarity": round(1.0 - hamming_distance(simhash, r["simhash"]) / 64, 3),
+                "simhash": other,
+                "distance": dist,
+                "similarity": round(1.0 - dist / 64, 3),
             }
     return None

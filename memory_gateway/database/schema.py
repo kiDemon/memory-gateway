@@ -543,3 +543,22 @@ def init_db(db: sqlite3.Connection) -> None:
             failure_count INTEGER NOT NULL DEFAULT 0
         )
     """)
+
+    # ── Dreams 矛盾记录表 ──────────────────────────────────
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS resolved_contradictions (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            memory_id_a TEXT NOT NULL,
+            memory_id_b TEXT NOT NULL,
+            resolution  TEXT NOT NULL
+                        CHECK (resolution IN ('keep_both', 'keep_a', 'keep_b', 'merge')),
+            note        TEXT DEFAULT '',
+            resolved_at TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (memory_id_a) REFERENCES memories(id),
+            FOREIGN KEY (memory_id_b) REFERENCES memories(id)
+        )
+    """)
+    db.execute("""
+        CREATE INDEX IF NOT EXISTS idx_resolved_contradictions_pair
+        ON resolved_contradictions(memory_id_a, memory_id_b)
+    """)

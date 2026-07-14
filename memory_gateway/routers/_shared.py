@@ -76,6 +76,9 @@ def row_to_dict(row: sqlite3.Row) -> dict:
             pass
     if "insights" in d:
         del d["insights"]
+    # 兼容老客户端：API 历史上用 category，库内字段是 category_id
+    if "category_id" in d and "category" not in d:
+        d["category"] = d["category_id"]
     return d
 
 

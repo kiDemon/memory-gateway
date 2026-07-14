@@ -6,6 +6,7 @@ Extracted from server.py (/mcp endpoint and related handlers).
 
 import json
 import logging
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -332,7 +333,11 @@ MCP_TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": ["scan", "merge", "stats"], "description": "操作类型：scan=扫描矛盾/相似，merge=自动合并，stats=统计"},
+                "action": {"type": "string", "enum": ["scan", "merge", "stats", "resolve"], "description": "操作类型：scan=扫描矛盾/相似，merge=自动合并，stats=统计，resolve=处理矛盾对"},
+                "id1": {"type": "string", "description": "矛盾对中的记忆ID A（resolve操作必填）"},
+                "id2": {"type": "string", "description": "矛盾对中的记忆ID B（resolve操作必填）"},
+                "resolution": {"type": "string", "enum": ["keep_both", "keep_a", "keep_b", "merge"], "description": "矛盾处理方式：keep_both=保留两条，keep_a=删除B保留A，keep_b=删除A保留B，merge=合并成一条新记忆（resolve操作必填）"},
+                "resolve_content": {"type": "string", "description": "合并后的新内容（resolution=merge时必填）"},
                 "category_filter": {"type": "string", "description": "分类过滤（可选）"},
                 "auto_merge": {"type": "boolean", "description": "自动合并相似度>0.9的记忆", "default": False}
             },
@@ -828,6 +833,124 @@ async def handle_mcp_tools_call(request_id: Any, params: dict) -> dict:
                                    f"发现 {manual_review_count} 对潜在重复，需要人工审核" if manual_review_count > 0 else 
                                    "无需合并，记忆库无冗余"
                     }
+                elif action == "resolve":
+                    id1 = arguments.get("id1")
+                    id2 = arguments.get("id2")
+                    resolution = arguments.get("resolution")
+                    resolve_content = arguments.get("resolve_content", "")
+
+                    if not id1 or not id2 or not resolution:
+                        result = {"error": "resolve 操作需要 id1、id2 和 resolution 参数"}
+                    elif resolution not in ("keep_both", "keep_a", "keep_b", "merge"):
+                        result = {"error": f"无效的 resolution 值: {resolution}，支持: keep_both, keep_a, keep_b, merge"}
+                    elif resolution == "merge" and not resolve_content:
+                        result = {"error": "merge 操作需要 resolve_content 参数"}
+                    else:
+                        # 检查两条记忆是否存在
+                        mem_a = db.execute("SELECT id, content, type, category_id FROM memories WHERE id=? AND archived=0", (id1,)).fetchone()
+                        mem_b = db.execute("SELECT id, content, type, category_id FROM memories WHERE id=? AND archived=0", (id2,)).fetchone()
+                        if not mem_a:
+                            result = {"error": f"记忆 {id1} 不存在或已归档"}
+                        elif not mem_b:
+                            result = {"error": f"记忆 {id2} 不存在或已归档"}
+                        else:
+                            # 检查是否已解决过
+                            existing = db.execute(
+                                "SELECT id, resolution FROM resolved_contradictions WHERE (memory_id_a=? AND memory_id_b=?) OR (memory_id_a=? AND memory_id_b=?)",
+                                (id1, id2, id2, id1)
+                            ).fetchone()
+                            if existing:
+                                result = {"error": f"该矛盾对已被处理过 (resolution={existing['resolution']})", "contradiction_id": existing["id"]}
+                            else:
+                                now = now_iso()
+                                note = ""
+
+                                if resolution == "keep_both":
+                                    note = "两条记忆均有价值，保留二者"
+                                    db.execute(
+                                        "INSERT INTO resolved_contradictions (memory_id_a, memory_id_b, resolution, note, resolved_at) VALUES (?, ?, ?, ?, ?)",
+                                        (id1, id2, "keep_both", note, now)
+                                    )
+                                    result = {"success": True, "resolution": "keep_both", "message": "两条记忆均保留"}
+
+                                elif resolution == "keep_a":
+                                    note = "保留 A 记忆，归档 B 记忆"
+                                    db.execute("UPDATE memories SET archived=1, updated_at=? WHERE id=?", (now, id2))
+                                    db.execute(
+                                        "INSERT INTO resolved_contradictions (memory_id_a, memory_id_b, resolution, note, resolved_at) VALUES (?, ?, ?, ?, ?)",
+                                        (id1, id2, "keep_a", note, now)
+                                    )
+                                    result = {"success": True, "resolution": "keep_a", "kept": id1, "archived": id2}
+
+                                elif resolution == "keep_b":
+                                    note = "保留 B 记忆，归档 A 记忆"
+                                    db.execute("UPDATE memories SET archived=1, updated_at=? WHERE id=?", (now, id1))
+                                    db.execute(
+                                        "INSERT INTO resolved_contradictions (memory_id_a, memory_id_b, resolution, note, resolved_at) VALUES (?, ?, ?, ?, ?)",
+                                        (id1, id2, "keep_b", note, now)
+                                    )
+                                    result = {"success": True, "resolution": "keep_b", "kept": id2, "archived": id1}
+
+                                elif resolution == "merge":
+                                    from memory_gateway.utils.crypto import compute_checksum, compute_simhash
+
+                                    new_id = str(uuid.uuid4())
+                                    merged_content = resolve_content.strip()
+                                    merged_checksum = compute_checksum(merged_content)
+                                    merged_simhash = compute_simhash(merged_content)
+                                    merged_type = "decision" if (mem_a["type"] == "decision" or mem_b["type"] == "decision") else "general"
+                                    merged_category = mem_a["category_id"] or mem_b["category_id"] or "general"
+                                    merged_tags = json.dumps(["merged_contradiction"])
+                                    merged_embedding = _compute_embedding(merged_content)
+                                    vector_clock = json.dumps({"resolve_merge": now})
+
+                                    db.execute(
+                                        """INSERT INTO memories
+                                           (id, content, type, scope, source, priority, confidence, tags, category_id,
+                                            embedding, hot_tier, ttl_days, vector_clock,
+                                            created_at, updated_at, recall_count, archived, checksum, simhash,
+                                            derived_from, superseded_by)
+                                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, NULL)""",
+                                        (new_id, merged_content, merged_type, "global", "dreams", "P1", 0.7, merged_tags, merged_category,
+                                         merged_embedding, 0, 365, vector_clock,
+                                         now, now, merged_checksum, merged_simhash,
+                                         json.dumps([id1, id2]))
+                                    )
+
+                                    # 归档两条旧记忆
+                                    db.execute("UPDATE memories SET archived=1, superseded_by=?, updated_at=? WHERE id=?", (new_id, now, id1))
+                                    db.execute("UPDATE memories SET archived=1, superseded_by=?, updated_at=? WHERE id=?", (new_id, now, id2))
+
+                                    # 插入 change_log
+                                    db.execute(
+                                        "INSERT INTO change_log (memory_id, action, snapshot, timestamp) VALUES (?, 'resolve_merge', ?, ?)",
+                                        (new_id, merged_content, now),
+                                    )
+                                    db.execute(
+                                        "INSERT INTO change_log (memory_id, action, snapshot, timestamp) VALUES (?, 'archived_by_resolve_merge', ?, ?)",
+                                        (id1, f"merged_into_{new_id}", now),
+                                    )
+                                    db.execute(
+                                        "INSERT INTO change_log (memory_id, action, snapshot, timestamp) VALUES (?, 'archived_by_resolve_merge', ?, ?)",
+                                        (id2, f"merged_into_{new_id}", now),
+                                    )
+
+                                    note = f"合并为新记忆 {new_id[:8]}"
+                                    db.execute(
+                                        "INSERT INTO resolved_contradictions (memory_id_a, memory_id_b, resolution, note, resolved_at) VALUES (?, ?, ?, ?, ?)",
+                                        (id1, id2, "merge", note, now)
+                                    )
+
+                                    db.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
+
+                                    result = {
+                                        "success": True,
+                                        "resolution": "merge",
+                                        "new_memory_id": new_id,
+                                        "archived": [id1, id2]
+                                    }
+
+                                db.commit()
                 else:
                     result = {"error": f"Unknown action: {action}"}
 

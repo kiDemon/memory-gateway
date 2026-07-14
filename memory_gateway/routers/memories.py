@@ -149,6 +149,7 @@ async def save_memory(req: SaveRequest) -> dict:
 
         graph_edges = _auto_create_relations(db, memory_id, content, category_id)
         _sync_hot_tier_from_cache(db)
+        hot_cache.clear()  # 新写入后立即失效搜索缓存
 
     return {"success": True, "action": "saved", "id": memory_id, "type": mem_type, "graph_edges": graph_edges}
 
@@ -156,6 +157,7 @@ async def save_memory(req: SaveRequest) -> dict:
 # ── Context Offload & 4-Layer Storage ────────────────────
 
 
+@router.post("/mcp/offload")
 async def offload_memory(req: OffloadRequest) -> dict:
     """Unload long text to raw_memories (L0), return index ID."""
     raw_id = str(uuid.uuid4())
@@ -172,6 +174,7 @@ async def offload_memory(req: OffloadRequest) -> dict:
     return {"success": True, "id": raw_id, "token_count": token_count}
 
 
+@router.get("/mcp/drilldown/{memory_id}")
 async def drilldown_memory(memory_id: str) -> dict:
     """Drill back to original content (L0) by ID."""
     with db_conn() as db:
@@ -200,9 +203,9 @@ async def get_scenario(category_id: str, days: int = 7) -> dict:
         rows = db.execute(
             "SELECT id, category_id, title, summary, memory_ids, "
             "time_window_start, time_window_end, created_at, updated_at "
-            "FROM scenarios WHERE category_id=? "
+            "FROM scenarios WHERE category_id=? AND created_at >= datetime('now', ? || ' days') "
             "ORDER BY created_at DESC LIMIT 50",
-            (category_id,),
+            (category_id, f"-{days}"),
         ).fetchall()
     results = []
     for r in rows:
@@ -243,6 +246,15 @@ async def get_persona(persona_type: str, name: str) -> dict:
 
 
 # ── Search ────────────────────────────────────────────────
+
+
+def _escape_like(s: str) -> str:
+    """Escape LIKE wildcards (% and _) so they are treated as literal characters."""
+    return (
+        s.replace("\\", "\\\\")
+        .replace("%", "\\%")
+        .replace("_", "\\_")
+    )
 
 
 @router.post("/mcp/search")
@@ -290,21 +302,22 @@ async def search_memory(req: SearchRequest) -> dict:
         q_len = len(req.q)
 
         if q_len == 1:
-            prefix_q = f"{req.q}%"
+            escaped_q = _escape_like(req.q)
+            prefix_q = f"{escaped_q}%"
             sql = f"""
                 SELECT m.*, 0 as rank
                 FROM memories m
-                WHERE m.content LIKE ? AND {where}
+                WHERE m.content LIKE ? ESCAPE '\\' AND {where}
                 ORDER BY m.created_at DESC
                 LIMIT ?
             """
             rows = db.execute(sql, [prefix_q] + params + [req.limit]).fetchall()
             if len(rows) < 5:
-                like_q = f"%{req.q}%"
+                like_q = f"%{escaped_q}%"
                 sql_wide = f"""
                     SELECT m.*, 0 as rank
                     FROM memories m
-                    WHERE m.content LIKE ? AND {where}
+                    WHERE m.content LIKE ? ESCAPE '\\' AND {where}
                     ORDER BY m.created_at DESC
                     LIMIT ?
                 """
@@ -328,21 +341,22 @@ async def search_memory(req: SearchRequest) -> dict:
                 rows = db.execute(sql, fts_params).fetchall()
                 search_type = "fts5_prefix_2char"
             except sqlite3.OperationalError:
-                prefix_q = f"{req.q}%"
+                escaped_q = _escape_like(req.q)
+                prefix_q = f"{escaped_q}%"
                 sql_fallback = f"""
                     SELECT m.*, 0 as rank
                     FROM memories m
-                    WHERE m.content LIKE ? AND {where}
+                    WHERE m.content LIKE ? ESCAPE '\\' AND {where}
                     ORDER BY m.created_at DESC
                     LIMIT ?
                 """
                 rows = db.execute(sql_fallback, [prefix_q] + params + [req.limit]).fetchall()
                 if len(rows) < 5:
-                    like_q = f"%{req.q}%"
+                    like_q = f"%{escaped_q}%"
                     sql_wide = f"""
                         SELECT m.*, 0 as rank
                         FROM memories m
-                        WHERE m.content LIKE ? AND {where}
+                        WHERE m.content LIKE ? ESCAPE '\\' AND {where}
                         ORDER BY m.created_at DESC
                         LIMIT ?
                     """
@@ -561,11 +575,12 @@ async def search_hybrid(req: SearchHybridRequest) -> dict:
         try:
             rows = db.execute(sql, params_all).fetchall()
         except sqlite3.OperationalError:
-            like_q = f"%{req.q}%"
+            escaped_q = _escape_like(req.q)
+            like_q = f"%{escaped_q}%"
             sql_fallback = f"""
                 SELECT m.*, 0 as rank
                 FROM memories m
-                WHERE m.content LIKE ? AND {where}
+                WHERE m.content LIKE ? ESCAPE '\\' AND {where}
                 ORDER BY m.created_at DESC
                 LIMIT ?
             """
@@ -583,12 +598,27 @@ async def search_hybrid(req: SearchHybridRequest) -> dict:
                 f"UPDATE memories SET last_recalled=?, recall_count=recall_count+1 WHERE id IN ({placeholders})",
                 [now] + ids,
             )
+            # Update confidence based on recall (same as mem_search)
+            for r in results:
+                new_conf = min(1.0, (r.get("confidence") or 0.8) + 0.01)
+                db.execute("UPDATE memories SET confidence=? WHERE id=?", (new_conf, r["id"]))
+                hot_cache.put(r["id"], r)
+
+        # Audit log (same as mem_search)
+        latency_ms = round((time.time() - t_start) * 1000, 2)
+        try:
+            db.execute(
+                "INSERT INTO search_audit_log (query, results_count, latency_ms, search_type, timestamp) VALUES (?, ?, ?, ?, ?)",
+                (req.q, len(results), latency_ms, "hybrid", now),
+            )
+        except Exception:
+            pass  # non-fatal
 
     return {
         "success": True,
         "count": len(results),
         "results": results,
-        "latency_ms": round((time.time() - t_start) * 1000, 2),
+        "latency_ms": latency_ms,
         "has_embedding": query_embedding is not None,
     }
 
@@ -1077,6 +1107,8 @@ async def batch_save(req: BatchSaveRequest) -> dict:
                 change_reason="Batch save",
                 metadata={"type": mtype, "category": cat, "priority": prio},
             )
+        if saved > 0:
+            hot_cache.clear()  # 批量写入后失效搜索缓存
     return {"success": True, "saved": saved, "skipped": skipped, "ids": ids}
 
 

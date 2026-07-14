@@ -415,7 +415,11 @@ class HotCache:
             return len(self._cache)
 
 
-hot_cache = HotCache()
+# 路由层使用 memory_gateway.routers._shared.hot_cache 为唯一实例。
+# 这里仅作兼容别名，避免 server 局部再 new 一份导致 clear 打空。
+from memory_gateway.routers._shared import hot_cache as hot_cache  # noqa: E402
+from memory_gateway.routers._shared import HotCache as _SharedHotCache  # noqa: E402
+HotCache = _SharedHotCache  # 兼容可能的外部引用
 
 
 def _sync_hot_tier_from_cache(db: sqlite3.Connection) -> None:
@@ -662,9 +666,11 @@ def row_to_dict(row: sqlite3.Row) -> dict:
 
 # ── FastAPI App ──────────────────────────────────────────
 
+APP_VERSION = "5.1.1"
+
 app = FastAPI(
     title="Memory Gateway",
-    version="4.0.0",
+    version=APP_VERSION,
     description="MCP Memory Server — Hermes + Claude Code + WorkBuddy",
 )
 
@@ -684,6 +690,7 @@ else:
     origins = [
         "http://localhost:8650",      # Memory Gateway Dashboard
         "http://127.0.0.1:8650",     # Memory Gateway Dashboard (alternative)
+        "http://8.137.178.236:8650", # 生产 Memory Gateway（公网）
         "http://localhost:3000",      # Common dev server
         "http://localhost:8093",      # Hermes Web UI
         "http://127.0.0.1:3000",
@@ -783,7 +790,7 @@ async def startup() -> None:
 async def health() -> dict:
     with db_conn() as db:
         count = db.execute("SELECT COUNT(*) FROM memories WHERE archived=0").fetchone()[0]
-    return {"status": "ok", "version": "5.1.0", "memories": count}
+    return {"status": "ok", "version": APP_VERSION, "memories": count}
 
 
 @app.get("/")

@@ -15,7 +15,9 @@ Module-level state
     from memory_gateway.middleware.auth import API_KEY as auth_API_KEY
     auth_API_KEY = api_key_value   # set by server.py at module init
 """
-
+import hashlib
+import hmac
+import logging
 import os
 import secrets
 import time
@@ -121,6 +123,22 @@ def _delete_session(token: str) -> None:
             db.execute("DELETE FROM user_sessions WHERE token=?", (token,))
     except Exception:
         log.warning("Failed to delete session (non-fatal)", exc_info=True)
+
+
+def _clear_all_sessions() -> int:
+    """Key 轮转/重置时清空全部会话，避免旧 cookie 继续访问管理端。"""
+    count = len(_sessions_cache)
+    _sessions_cache.clear()
+    try:
+        with db_conn() as db:
+            cur = db.execute("DELETE FROM user_sessions")
+            # sqlite3 rowcount may be -1; prefer cache size as floor
+            if cur.rowcount and cur.rowcount > 0:
+                count = max(count, cur.rowcount)
+    except Exception:
+        log.warning("Failed to clear all sessions from DB (non-fatal)", exc_info=True)
+    log.warning("Cleared %s session(s) after API key change", count)
+    return count
 
 
 # ── IP lockout helpers ────────────────────────────────────
@@ -250,7 +268,7 @@ def login_page_html(error: str = "") -> str:
 </style></head>
 <body>
 <div class="card">
-  <h1>Memory Gateway v4</h1>
+  <h1>Memory Gateway v5.1.1</h1>
   <p>输入 API Key 登录管理面板。<br>首次运行请查看 <code>docker logs memory-gateway</code> 获取自动生成的密钥。</p>
   {err_block}
   <form id="loginForm" onsubmit="login(event)">
@@ -278,8 +296,10 @@ async function login(e) {{
     }});
     const d = await r.json();
     if (r.ok) {{
+      // 与 dashboard 统一使用 mg_api_key；兼容旧 key 一并写入
+      localStorage.setItem('mg_api_key', key);
       localStorage.setItem('memory_gateway_key', key);
-      window.location.href = '/admin';
+      window.location.href = '/dashboard';
     }} else {{
       document.querySelector('.error')?.remove();
       const errDiv = document.createElement('div');
@@ -333,7 +353,8 @@ async def api_key_middleware(request: Request, call_next):
         key = request.headers.get("X-API-Key", "") or request.headers.get(
             "Authorization", ""
         ).removeprefix("Bearer ")
-        if key == API_KEY:
+        # compare_digest 要求等长，否则抛 ValueError
+        if key and len(key) == len(API_KEY) and hmac.compare_digest(key, API_KEY):
             return await call_next(request)
 
         # Check session cookie (uses token, not raw API Key)
