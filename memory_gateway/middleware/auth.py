@@ -348,6 +348,12 @@ async def api_key_middleware(request: Request, call_next):
     if request.url.path.startswith("/static/"):
         return await call_next(request)
 
+    # vault health: fully public (probe endpoint)
+    if request.url.path == "/vault/health":
+        return await call_next(request)
+
+    # vault API: requires X-API-Key or session cookie (handled below)
+
     if API_KEY:
         # Check header (X-API-Key or Authorization: Bearer)
         key = request.headers.get("X-API-Key", "") or request.headers.get(
@@ -385,7 +391,13 @@ async def api_key_middleware(request: Request, call_next):
             return await call_next(request)
 
         # Auth failed — return login page for browser, JSON for API
-        if request.url.path == "/" or request.url.path.startswith("/admin") or request.url.path == "/dashboard":
+        is_browser_path = (
+            request.url.path == "/" or
+            request.url.path.startswith("/admin") or
+            request.url.path == "/dashboard" or
+            request.url.path.startswith("/vault/")
+        )
+        if is_browser_path:
             return HTMLResponse(
                 status_code=401,
                 content=login_page_html(),

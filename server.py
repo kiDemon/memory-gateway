@@ -820,10 +820,12 @@ if STATIC_DIR.exists():
 from memory_gateway.routers.memories import router as memories_router
 from memory_gateway.routers.categories import router as categories_router
 from memory_gateway.routers.mcp import router as mcp_router
+from memory_gateway.routers.vault import router as vault_router
 
 app.include_router(memories_router)
 app.include_router(categories_router)
 app.include_router(mcp_router)
+app.include_router(vault_router)
 
 # ── Enhancement Router (借鉴左脑理念) ─────────────────
 from memory_gateway.enhancement import enhancement_router
