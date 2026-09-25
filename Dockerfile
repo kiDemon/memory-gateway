@@ -16,6 +16,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY server.py entrypoint.sh ./
 COPY memory_gateway/ ./memory_gateway/
 COPY static/ ./static/
+COPY scripts/ ./scripts/
 RUN chmod +x entrypoint.sh && mkdir -p /data
 
 EXPOSE 8650
