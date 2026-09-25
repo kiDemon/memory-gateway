@@ -185,7 +185,10 @@ def smart_save_with_merge(content: str, category_id: str = "general",
     - merged_with: 合并的目标记忆ID（如果是merged）
     """
     from memory_gateway.utils.crypto import compute_checksum
-    
+    from memory_gateway.utils.privacy import _filter_sensitive
+
+    # 与 save/batch_save 一致：先过滤敏感信息再算指纹，保证跨路径去重可比
+    content = _filter_sensitive(content.strip())
     checksum = compute_checksum(content)
     simhash = compute_simhash(content)
     
@@ -229,22 +232,28 @@ def smart_save_with_merge(content: str, category_id: str = "general",
             merged_content = _merge_contents(old_content, content)
             
             now = now_iso()
+            from memory_gateway.utils.embedding import _compute_embedding
             db.execute(
                 """UPDATE memories 
-                   SET content=?, updated_at=?, checksum=?, simhash=?
+                   SET content=?, updated_at=?, checksum=?, simhash=?, embedding=?
                    WHERE id=?""",
                 (merged_content, now, compute_checksum(merged_content),
-                 compute_simhash(merged_content), best_match["id"])
+                 compute_simhash(merged_content), _compute_embedding(merged_content),
+                 best_match["id"])
             )
             
-            # 记录变更
+            # 记录变更 + 版本快照（merge 也是内容演进，必须可回溯）
             db.execute(
                 """INSERT INTO change_log (memory_id, action, snapshot, timestamp)
                    VALUES (?, 'merge', ?, ?)""",
                 (best_match["id"], f"Merged with new content (similarity={best_similarity:.2f})", now)
             )
-            
-            db.commit()
+            from memory_gateway.services.version_service import VersionManager
+            VersionManager.create_version(
+                db, best_match["id"], merged_content,
+                change_type="merge", changed_by=source,
+                change_reason=f"smart_save merged (similarity={best_similarity:.2f})",
+            )
             
             return {
                 "success": True,
@@ -253,22 +262,27 @@ def smart_save_with_merge(content: str, category_id: str = "general",
                 "similarity": best_similarity
             }
         
-        # 4. 相似度不足：作为新记忆保存
-        # 调用原有的save逻辑
-        from memory_gateway.routers.memories import save_memory
+        # 4. 相似度不足：作为新记忆保存（走与 /mcp/save 相同的公共写入逻辑）
+        import uuid
         from memory_gateway.models.requests import SaveRequest
-        
+        from memory_gateway.routers.memories import _insert_memory, _prepare_save
+        from memory_gateway.routers._shared import hot_cache
+
         req = SaveRequest(
             content=content,
             category_id=category_id,
             source=source,
             tags=tags
         )
-        
-        # 这里需要异步调用，但为了简化，直接返回指示
+        now = now_iso()
+        prepared = _prepare_save(req, now, str(uuid.uuid4()))
+        _insert_memory(db, prepared, now)
+        hot_cache.clear()
+
         return {
             "success": True,
-            "action": "new",
+            "action": "saved",
+            "id": prepared["id"],
             "similarity_with_best": best_similarity,
             "best_match_id": best_match["id"] if best_match else None
         }

@@ -6,6 +6,8 @@ Extracted from server.py (/mcp/categories endpoints).
 
 from typing import Optional
 
+import sqlite3
+
 from fastapi import APIRouter, HTTPException
 from memory_gateway.database.connection import db_conn
 from memory_gateway.models.requests import CategoryRequest, CategoryUpdateRequest
@@ -47,10 +49,17 @@ async def create_category(req: CategoryRequest) -> dict:
         existing = db.execute("SELECT id FROM categories WHERE id=?", (req.id,)).fetchone()
         if existing:
             raise HTTPException(status_code=409, detail=f"Category {req.id} already exists")
-        db.execute(
-            "INSERT INTO categories (id, name, parent_id, icon, sort_order) VALUES (?, ?, ?, ?, ?)",
-            (req.id, req.name, req.parent_id, req.icon or "📁", req.sort_order or 0),
-        )
+        if req.parent_id:
+            parent = db.execute("SELECT id FROM categories WHERE id=?", (req.parent_id,)).fetchone()
+            if not parent:
+                raise HTTPException(status_code=400, detail=f"parent_id {req.parent_id} 不存在")
+        try:
+            db.execute(
+                "INSERT INTO categories (id, name, parent_id, icon, sort_order) VALUES (?, ?, ?, ?, ?)",
+                (req.id, req.name, req.parent_id, req.icon or "📁", req.sort_order or 0),
+            )
+        except sqlite3.IntegrityError:
+            raise HTTPException(status_code=400, detail="分类外键约束失败（parent_id 不存在）")
     return {"success": True, "category": {"id": req.id, "name": req.name}}
 
 
@@ -67,6 +76,12 @@ async def update_category(category_id: str, req: CategoryUpdateRequest) -> dict:
             updates.append("name=?")
             params.append(req.name)
         if req.parent_id is not None:
+            if req.parent_id:
+                parent = db.execute("SELECT id FROM categories WHERE id=?", (req.parent_id,)).fetchone()
+                if not parent:
+                    raise HTTPException(status_code=400, detail=f"parent_id {req.parent_id} 不存在")
+                if req.parent_id == category_id:
+                    raise HTTPException(status_code=400, detail="parent_id 不能是自身")
             updates.append("parent_id=?")
             params.append(req.parent_id)
         if req.icon is not None:

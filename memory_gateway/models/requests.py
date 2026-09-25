@@ -6,11 +6,11 @@ All model definitions remain unchanged.
 
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class SaveRequest(BaseModel):
-    content: str = Field(..., max_length=100000)
+    content: str = Field(..., min_length=1, max_length=100000)
     type: Optional[str] = Field(default=None, pattern=r"^(general|rule|preference|decision|context|learning|reference|convention|procedural|insight)$")
     scope: Optional[str] = Field(default="global", pattern=r"^(global|project|agent)$")
     source: Optional[str] = Field(default="unknown", pattern=r"^(hermes|claude|workbuddy|system|unknown)$")
@@ -20,18 +20,44 @@ class SaveRequest(BaseModel):
     session_id: Optional[str] = None
     id: Optional[str] = None
     derived_from: Optional[list[str]] = Field(default=None, description="来源记忆ID列表（进化产物血缘）")
-    superseded_by: Optional[str] = Field(default=None, description="（写入收敛）本条取代的旧条 ID。写入时旧条会被自动 archive，并将其 superseded_by 字段设为新条 ID")
+    superseded_by: Optional[str] = Field(default=None, description="（兼容别名，语义同 supersedes）本条取代的旧条 ID。旧条会被自动 archive，并将其 superseded_by 字段设为本新条 ID")
+    supersedes: Optional[str] = Field(default=None, description="（推荐）本条取代的旧条 ID。写入时旧条会被自动 archive，并将其 superseded_by 字段设为本新条 ID")
     insights: Optional[str] = Field(default=None, max_length=5000, description="提炼结论：从这条记忆学到了什么")
+
+    @field_validator("content")
+    @classmethod
+    def _content_not_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("content 不能为空或纯空白字符")
+        return v
+
+    @model_validator(mode="after")
+    def _reconcile_supersede(self) -> "SaveRequest":
+        # 统一语义：参数值 = 被取代的旧条 ID（archive 旧条、写回追溯链）。
+        # supersedes 与 superseded_by 同义，同时传且不一致时拒绝。
+        if self.supersedes and self.superseded_by and self.supersedes != self.superseded_by:
+            raise ValueError("supersedes 与 superseded_by 不一致，请只传一个")
+        if self.supersedes and not self.superseded_by:
+            self.superseded_by = self.supersedes
+        return self
 
 
 class UpdateRequest(BaseModel):
-    content: Optional[str] = Field(default=None, max_length=100000)
-    type: Optional[str] = Field(default=None, pattern=r"^(general|rule|preference|decision|context|learning|reference|convention|procedural)$")
+    content: Optional[str] = Field(default=None, min_length=1, max_length=100000)
+    type: Optional[str] = Field(default=None, pattern=r"^(general|rule|preference|decision|context|learning|reference|convention|procedural|insight)$")
     scope: Optional[str] = Field(default=None, pattern=r"^(global|project|agent)$")
     priority: Optional[str] = Field(default=None, pattern=r"^(P0|P1|P2)$")
     category_id: Optional[str] = Field(default=None, pattern=r"^[a-z][a-z0-9_]{0,63}$")
     tags: Optional[list[str]] = None
     archived: Optional[bool] = None
+    insights: Optional[str] = Field(default=None, max_length=5000, description="提炼结论：从这条记忆学到了什么")
+
+    @field_validator("content")
+    @classmethod
+    def _content_not_blank(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and not v.strip():
+            raise ValueError("content 不能为空或纯空白字符")
+        return v
 
 
 class SearchRequest(BaseModel):

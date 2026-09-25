@@ -242,9 +242,28 @@ def _clear_failures(ip: str) -> None:
 # ── Cookie-based session auth ────────────────────────────
 
 
-def login_page_html(error: str = "") -> str:
-    """Return a standalone login page HTML."""
-    err_block = f'<div class="error">{error}</div>' if error else ""
+def login_page_html(error: str = "", next_path: str = "") -> str:
+    """Return a standalone login page HTML.
+
+    next_path: if non-empty, JS will redirect here after successful login
+               (must be a vault-relative path starting with '/' to avoid open-redirect).
+               Defaults to '/dashboard' for backward compatibility.
+    """
+    from html import escape as _esc
+    import json as _json
+
+    def _safe_next(p: str) -> bool:
+        # 同源绝对路径：单个 '/' 开头（防 //evil.com、反斜杠绕过），
+        # 不含反斜杠/引号/尖括号/控制字符（防 HTML 与 </script> 注入）
+        return (p.startswith("/") and not p.startswith("//")
+                and chr(92) not in p
+                and not any(c in p for c in "<>" + chr(39) + '"' + chr(96))
+                and all(ord(c) >= 0x20 for c in p))
+
+    if not _safe_next(next_path):
+        next_path = "/dashboard"
+    next_display = "管理面板" if next_path == "/dashboard" else "后跳转到 " + _esc(next_path)
+    err_block = f'<div class="error">{_esc(error)}</div>' if error else ""
     return f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head><meta charset="utf-8"><title>Memory Gateway — Login</title>
@@ -268,8 +287,8 @@ def login_page_html(error: str = "") -> str:
 </style></head>
 <body>
 <div class="card">
-  <h1>Memory Gateway v5.1.1</h1>
-  <p>输入 API Key 登录管理面板。<br>首次运行请查看 <code>docker logs memory-gateway</code> 获取自动生成的密钥。</p>
+  <h1>Memory Gateway — 登录</h1>
+  <p>输入 API Key 登录{next_display}。<br>首次运行请查看 <code>docker logs memory-gateway</code> 获取自动生成的密钥。</p>
   {err_block}
   <form id="loginForm" onsubmit="login(event)">
     <label for="key">API Key</label>
@@ -280,6 +299,7 @@ def login_page_html(error: str = "") -> str:
   <div class="footer">MCP Memory Server &mdash; 融合记忆网关</div>
 </div>
 <script>
+const NEXT = {_json.dumps(next_path, ensure_ascii=False).replace('<', chr(92) + 'u003c').replace('>', chr(92) + 'u003e')};
 async function login(e) {{
   e.preventDefault();
   const key = document.getElementById('key').value.trim();
@@ -299,7 +319,8 @@ async function login(e) {{
       // 与 dashboard 统一使用 mg_api_key；兼容旧 key 一并写入
       localStorage.setItem('mg_api_key', key);
       localStorage.setItem('memory_gateway_key', key);
-      window.location.href = '/dashboard';
+      // 登录后跳到原本想去的页面（vault 等），默认 dashboard
+      window.location.href = NEXT;
     }} else {{
       document.querySelector('.error')?.remove();
       const errDiv = document.createElement('div');
@@ -398,9 +419,12 @@ async def api_key_middleware(request: Request, call_next):
             request.url.path.startswith("/vault/")
         )
         if is_browser_path:
+            # 把用户原本想去的路径传给登录页，登录后跳回去
+            # 只传路径（不含 query），防 open-redirect
+            redirect_path = request.url.path if request.url.path != "/" else "/dashboard"
             return HTMLResponse(
                 status_code=401,
-                content=login_page_html(),
+                content=login_page_html(next_path=redirect_path),
             )
         return JSONResponse(
             status_code=401,

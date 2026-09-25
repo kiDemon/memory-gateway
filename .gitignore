@@ -3,6 +3,12 @@ data/
 
 # Environment secrets
 .env
+.env.vault
+
+# Local databases (never commit)
+*.db
+*.db-wal
+*.db-shm
 
 # Python
 __pycache__/

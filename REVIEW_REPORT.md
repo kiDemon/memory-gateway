@@ -1,3 +1,62 @@
+# Memory Gateway 第二轮代码审查报告（2026-09-25）
+
+**代码版本**: v5.2.0（commit f14b970 + 工作区改动）
+**范围**: memory_gateway/ 全部模块（10.5K 行）、tests/、仓库卫生
+**方式**: 4 组并行审查 + 逐条对照源码核实 + 真实 app/schema 端到端实测
+**验证基线**: `pytest tests/ -q` → 109 passed（修复前 101 passed / 2 failed）
+
+## 一、已修复（本次提交）
+
+| # | 级别 | 问题 | 位置 | 修法 |
+|---|------|------|------|------|
+| 1 | 高危 | 2 字中文检索静默返回空（trigram 分词器最少 3 字符，FTS 不报错只返回空，except 里的 LIKE 兜底永不触发）；hybrid 检索同样受影响 | memories.py 搜索分支 | q_len<=2 直接走 LIKE 分支；hybrid 短查询同样；`_hybrid_search` 仅重排不做候选生成的问题在注释中说明 |
+| 2 | 高危 | 登录页反射型 XSS：next_path 校验只用 `re.match` 匹配前 2 字符，且裸拼进 HTML 与 `<script>`（`</script>` 可闭合），未登录即可触发 | middleware/auth.py login_page_html | 路径白名单校验（单斜杠开头、无引号/尖括号/反斜杠/控制字符）+ `html.escape` + `json.dumps` 并转义 `\u003c/\u003e` |
+| 3 | 中危 | 搜索缓存键缺 scope_filter：不同 scope 的查询互相命中错误缓存 | memories.py search_memory | cache_key 补 scope_filter |
+| 4 | 中危 | save 与 batch_save 行为漂移（指纹是否 strip、是否过滤敏感信息、自动标签、TTL/hot_tier 规则、insights/derived_from/superseded_by 是否落库）→ 跨路径去重失效、敏感信息经 batch_save 直入库 | memories.py | 抽出 `_prepare_save()` + `_insert_memory()` 公共写入路径，两条路径共用 |
+| 5 | 中危 | 单条 save 静默丢弃 `insights` 字段（模型里有、INSERT 里没有） | memories.py | INSERT 补 insights 列；单条读取 `mem_get` 显式带回 insights |
+| 6 | 中危 | hybrid 检索审计日志列名错（`results_count`/`timestamp` 不存在），每次写入失败被 `except: pass` 吞掉，审计永远缺失 | memories.py search_hybrid | 列名对齐 schema（result_count/created_at/hit_cache），异常改为告警日志 |
+| 7 | 中危 | `smart_save_with_merge` 的"新保存"分支只返回指示、从不落盘 → 数据静默丢失 | enhancement.py | 真正调用公共写入路径；merge 分支补 embedding 更新与版本快照 |
+| 8 | 中危 | vault 禁用标记失效：`Path()` 等于当前工作目录且恒为真 → VAULT_ENABLED=True，路径缺失时 tree/search/backlinks 会扫描工作目录 | routers/vault.py | 禁用态显式置 `None`；三个路由补 503 守卫 |
+| 9 | 中危 | delete_memory 未清理 memory_relations / resolved_contradictions（后者 FK 无级联）→ 删除报 IntegrityError 500 | memories.py | 删除前清理关联表 |
+| 10 | 低危 | MCP 端点对非法 params（null/数组、body 非对象）抛 AttributeError → 500 而非 JSON-RPC 错误码 | routers/mcp.py | body 非对象 → -32600；params 非对象 → -32602 |
+| 11 | 低危 | 空内容 / 纯空白内容可入库 | models/requests.py | `min_length=1` + 去空白校验（测试转绿） |
+| 12 | 低危 | 分类 parent_id 不存在时抛裸 IntegrityError 500（测试转绿） | routers/categories.py | 建/改分类均校验父分类存在，返回 400 |
+| 13 | 低危 | 增量同步 `since` 只比对 created_at，旧记忆被更新后永远同步不到 | memories.py list_memory | 改为 updated_at 或 created_at 命中 |
+| 14 | 低危 | confidence 每次检索 +0.02 无上限，高频检索记忆全部趋近 1.0 失去区分度；hybrid 为逐条 UPDATE（N+1）；缓存命中不计数 | memories.py | 统一 `_bump_recall()`：饱和增长（趋近 0.95）、单条批量 UPDATE、缓存命中也计数并写审计 |
+| 15 | 低危 | 去重先查后插、checksum 无唯一约束，并发/跨路径可插重复 | database/schema.py | 新增部分唯一索引 `idx_memories_checksum_active`（WHERE archived=0），创建失败降级告警；save/batch_save/update 捕获 IntegrityError |
+| 16 | 低危 | `superseded_by` 参数名与语义相反（实际=本条取代的旧条），MCP 工具描述更是反的："被哪条记忆取代（指向新记忆ID）"，按描述调用会归档错记录 | models/requests.py, routers/mcp.py | 新增推荐别名 `supersedes`，统一语义与文档描述 |
+| 17 | 低危 | UpdateRequest 类型枚举缺 insight，insight 类型记忆无法原样更新 | models/requests.py | 补枚举；同时给 UpdateRequest 增加 insights 字段 |
+| 18 | 低危 | update 的 checksum/simhash 用未 strip 内容、content 存 strip 后 → 与 save 指纹不可比 | memories.py | 统一基于最终存储内容计算 |
+| 19 | 低危 | `hot_cache.put(r["id"], r)` 无任何读取方，混用键空间 | memories.py | 移除 |
+| 20 | 低危 | FTS 重建判据要求 `prefix=2,1` 而 CREATE 语句从不带该选项 → 每次启动都 DROP 并重建整张 FTS 表（且 trigram 下 prefix 索引无意义） | database/schema.py | 去掉该判据；重建时不再排除归档行（归档行缺失会让 include_archived 检索漏） |
+| 21 | 低危 | 仓库卫生：`.env.vault`、`memory.db` 未被忽略，误提交即泄密/污染 | .gitignore | 忽略 `.env.vault`、`*.db`、`*.db-wal`、`*.db-shm` |
+
+## 二、新增能力
+
+- `scripts/dedup_active_checksums.py`：清理历史遗留的活跃重复记忆（默认 dry-run，`--apply` 归档冗余条并把 superseded_by 写回保留条，保留追溯链）。
+- 测试新增：2 字中文检索（普通/hybrid）、insights 落库、批量路径隐私过滤与跨路径判重、矛盾记录记忆的删除、分类父校验。
+
+## 三、实测结论（真实 app + 真实 schema）
+
+- 2 字查询命中：`like_wide_short`（修复前 0 条）；
+- 不同 scope 查询互不污染缓存；
+- `supersedes` 归档旧条且旧条默认不出现在检索结果；
+- batch_save 与 save 跨路径判重、敏感信息脱敏、insights 保留一致；
+- MCP 非法输入返回 -32600/-32602，不再 500；
+- vault 未配置时三个入口均 503，不再扫描工作目录；
+- 注入型登录跳转路径被消除（无 `<script>` / `onerror` 反射）；
+- 二次启动不再重建 FTS；checksum 唯一索引生效并拦截重复。
+
+## 四、遗留建议（未改，供决策）
+
+1. **线上库历史重复**：唯一索引在线上若因历史重复创建失败，需执行 `scripts/dedup_active_checksums.py --apply` 后重启一次以建索引。
+2. **git remote 明文 PAT**：`.git/config` 中 remote URL 内嵌 GitHub PAT，建议改用 credential helper 或 SSH，避免配置外泄即失权。
+3. **`_hybrid_search` 语义能力**：当前仅对 FTS 候选重排，不做向量候选生成；若要真正的语义召回，需独立向量检索通道。
+4. **搜索路径的 LIKE 全表扫描**：1-2 字查询为 LIKE `%…%`，数据量大时需引入 n-gram 辅助表或 FTS 二元分词。
+5. **仓库残留**：根目录 `server.py.bak.*`、`memory.db`（0 字节占位）可清理。
+
+---
+
 # Memory Gateway 代码审查报告
 
 **审查时间**: 2026-06-03  

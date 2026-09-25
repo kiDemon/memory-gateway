@@ -72,20 +72,22 @@ router = APIRouter(tags=["mcp"])
 MCP_TOOLS = [
     {
         "name": "mem_save",
-        "description": "保存一条记忆到记忆库。支持分类、优先级、标签等元数据。支持血缘追踪(derived_from)和替代关系(superseded_by)。写入收敛：传入 superseded_by 时，会自动把被指向的旧条 archive（旧条默认从 search/list 中排除）。",
+        "description": "保存一条记忆到记忆库。支持分类、优先级、标签等元数据。支持血缘追踪(derived_from)、提炼结论(insights)和替代收敛(supersedes)。写入收敛：传入 supersedes（或兼容别名 superseded_by）= 被取代的旧条 ID，会自动把该旧条 archive（旧条默认从 search/list 中排除，追溯链保留在旧条的 superseded_by 字段）。",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "content": {"type": "string", "description": "记忆内容"},
                 "category_id": {"type": "string", "description": "分类ID (learning/life/work/innovation/general 或 work_* 子分类)", "default": "general"},
-                "type": {"type": "string", "enum": ["general", "rule", "preference", "decision", "context", "learning", "reference", "convention", "insight"], "default": "general"},
+                "type": {"type": "string", "enum": ["general", "rule", "preference", "decision", "context", "learning", "reference", "convention", "procedural", "insight"], "default": "general"},
                 "priority": {"type": "string", "enum": ["P0", "P1", "P2"], "default": "P1"},
                 "tags": {"type": "array", "items": {"type": "string"}, "description": "自定义标签"},
                 "source": {"type": "string", "enum": ["hermes", "claude", "workbuddy", "system", "unknown"], "default": "unknown"},
                 "scope": {"type": "string", "enum": ["global", "project", "agent"], "default": "global"},
                 "session_id": {"type": "string", "description": "会话ID（可选）"},
                 "derived_from": {"type": "array", "items": {"type": "string"}, "description": "来源记忆ID列表（进化产物血缘追踪）"},
-                "superseded_by": {"type": "string", "description": "被哪条记忆取代（指向新记忆ID）"}
+                "supersedes": {"type": "string", "description": "（推荐）本条取代的旧条 ID。旧条会被自动 archive 并写回 superseded_by=新条ID"},
+                "superseded_by": {"type": "string", "description": "（兼容别名，语义同 supersedes）本条取代的旧条 ID。注意：不是'被谁取代'，传旧条 ID"},
+                "insights": {"type": "string", "description": "提炼结论：从这条记忆学到了什么"}
             },
             "required": ["content"]
         }
@@ -110,7 +112,7 @@ MCP_TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "since": {"type": "string", "description": "ISO8601 时间戳（增量同步）"},
+                "since": {"type": "string", "description": "ISO8601 时间戳（增量同步：返回该时间后新建或被更新的记忆）"},
                 "category_filter": {"type": "string", "description": "分类过滤"},
                 "limit": {"type": "integer", "description": "返回数量", "default": 50}
             }
@@ -1440,9 +1442,25 @@ async def mcp_endpoint(request: Request) -> JSONResponse:
             content={"jsonrpc": "2.0", "error": {"code": -32700, "message": "Parse error"}}
         )
 
+    if not isinstance(body, dict):
+        log.warning("MCP endpoint: request body is not a JSON object")
+        return JSONResponse(
+            status_code=400,
+            content={"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "Invalid Request"}}
+        )
+
     method = body.get("method", "")
     request_id = body.get("id")
     params = body.get("params", {})
+    if params is None:
+        params = {}
+    if not isinstance(params, dict):
+        # JSON-RPC 允许 params 为数组，但本服务所有方法都按对象取值，
+        # 统一返回 -32602 而不是让 params.get 抛 AttributeError 变成 500
+        return JSONResponse(
+            content={"jsonrpc": "2.0", "id": request_id,
+                     "error": {"code": -32602, "message": "Invalid params: expected object"}}
+        )
 
     if method == "notifications/initialized":
         return JSONResponse(status_code=200, content={})

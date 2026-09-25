@@ -126,11 +126,9 @@ def init_db(db: sqlite3.Connection) -> None:
             fts_sql = fts_info[0] or ''
             if 'category_id' not in fts_sql:
                 needs_fts_rebuild = True
-            elif 'prefix' not in fts_sql or 'prefix=2,1' not in fts_sql:
-                log.info(
-                    "Migrating: rebuilding FTS5 with prefix=2,1 for short query support"
-                )
-                needs_fts_rebuild = True
+            # 注意：trigram 分词器下 prefix 索引没有任何作用（token 固定 3 字符），
+            # 短查询（1-2 字）由 memories.py 走 LIKE 分支处理。
+            # 此处不再检查 'prefix=2,1'——CREATE 语句从不带该选项，否则每次启动都会重建 FTS。
             if needs_fts_rebuild:
                 log.info("Dropping old FTS5 table for rebuild")
                 db.executescript("""
@@ -237,7 +235,7 @@ def init_db(db: sqlite3.Connection) -> None:
         PRIMARY KEY (source_id, target_id)
     );
 
-    -- FTS5 全文索引 (trigram prefix=2,1 支持1-2字符前缀查询)
+    -- FTS5 全文索引 (trigram 分词；1-2 字短查询由应用层 LIKE 分支兜底)
     CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
         content,
         category_id,
@@ -411,13 +409,36 @@ def init_db(db: sqlite3.Connection) -> None:
     CREATE INDEX IF NOT EXISTS idx_skills_name ON skills(name);
     """)
 
+    # ── 去重约束：活跃记忆 checksum 唯一（部分索引，归档件不受限）──
+    # 防并发/批内重复写入。历史数据已有重复时创建失败 → 告警降级，不阻塞启动。
+    # 应用层 save / batch_save / update 对 IntegrityError 均有兜底。
+    try:
+        db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_checksum_active "
+            "ON memories(checksum) WHERE archived=0"
+        )
+        db.commit()
+    except sqlite3.Error as e:
+        db.rollback()
+        dup_count = 0
+        try:
+            dup_count = db.execute(
+                "SELECT COUNT(*) FROM (SELECT checksum FROM memories WHERE archived=0 "
+                "GROUP BY checksum HAVING COUNT(*) > 1)"
+            ).fetchone()[0]
+        except sqlite3.Error:
+            pass
+        log.warning(
+            "checksum 唯一索引创建失败，去重仅剩应用层检查（活跃重复组=%d）：%s", dup_count, e
+        )
+
     # Rebuild FTS5 from existing data after migration
     if needs_fts_rebuild:
         try:
             db.execute("""
                 INSERT INTO memories_fts(rowid, content, category_id, tags, type, scope, source)
                 SELECT rowid, content, COALESCE(category_id,'general'), tags, type, scope, source
-                FROM memories WHERE archived = 0
+                FROM memories
             """)
             db.commit()
             log.info("FTS5 rebuilt from existing memories")

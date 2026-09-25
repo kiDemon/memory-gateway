@@ -72,6 +72,9 @@ class TestSaveMemory:
         )
         data = resp.json()
         assert data["success"] is True
+        # insights 必须真正落库（曾静默丢失，导致自我蒸馏结论无法追溯）
+        mem = test_client.get(f"/mcp/get/{data['id']}").json()["memory"]
+        assert mem["insights"] == "Fixtures allow clean test isolation"
 
     def test_save_procedural_auto_hot(self, test_client):
         resp = test_client.post(
@@ -203,7 +206,7 @@ class TestSearchMemory:
         assert all(r["source"] == "hermes" for r in data["results"])
 
     def test_search_short_query(self, test_client):
-        """1-2 char queries should still work."""
+        """1-2 字符查询必须能命中（trigram 分词器不足 3 字符会静默返回空）。"""
         test_client.post(
             "/mcp/save", json={"content": "Go to the store"}
         )
@@ -212,6 +215,29 @@ class TestSearchMemory:
         )
         data = resp.json()
         assert data["success"] is True
+
+    def test_search_two_char_chinese(self, test_client):
+        """2 字中文（最高频检索形态）必须能命中，不能返回空。"""
+        test_client.post(
+            "/mcp/save",
+            json={"content": "记忆网关的排班系统需要支持两字检索", "source": "system"},
+        )
+        for q in ["排班", "两字", "网关"]:
+            data = test_client.post("/mcp/search", json={"q": q, "limit": 10}).json()
+            assert data["success"] is True
+            assert data["count"] >= 1, f"2 字查询 {q!r} 返回空结果"
+
+    def test_search_hybrid_two_char_chinese(self, test_client):
+        """hybrid 检索同样不能因短查询返回空。"""
+        test_client.post(
+            "/mcp/save",
+            json={"content": "隐患识别的课程安排在下周", "source": "system"},
+        )
+        data = test_client.post(
+            "/mcp/search_hybrid", json={"q": "隐患", "limit": 10}
+        ).json()
+        assert data["success"] is True
+        assert data["count"] >= 1
 
 
 class TestUpdateMemory:
@@ -356,6 +382,59 @@ class TestDeleteMemory:
         )
         ids = [m["id"] for m in list_resp.json().get("memories", [])]
         assert mem_id not in ids
+
+    def test_delete_with_resolved_contradiction(self, test_client):
+        """出现在梦境矛盾记录中的记忆也必须能删除（FK 无级联，曾 500）。"""
+        save_a = test_client.post("/mcp/save", json={"content": "矛盾记忆A", "source": "system"}).json()
+        save_b = test_client.post("/mcp/save", json={"content": "矛盾记忆B", "source": "system"}).json()
+        import sqlite3 as _sq
+        from memory_gateway.database.connection import get_db
+        conn = get_db()
+        conn.execute(
+            "INSERT INTO resolved_contradictions (memory_id_a, memory_id_b, resolution, note) "
+            "VALUES (?, ?, 'keep_both', 'test')",
+            (save_a["id"], save_b["id"]),
+        )
+        conn.commit()
+        conn.close()
+        resp = test_client.delete(f"/mcp/delete/{save_a['id']}")
+        assert resp.status_code == 200
+
+
+class TestBatchSaveParity:
+    """batch_save 必须与单条 save 行为一致（曾漂移：不过滤敏感信息、指纹算法不同）。"""
+
+    def test_batch_save_privacy_filter(self, test_client):
+        resp = test_client.post(
+            "/mcp/batch_save",
+            json={"memories": [{"content": "token: sk-abcdefghijklmnopqrstuvwxyz123456", "source": "system"}]},
+        )
+        assert resp.json()["saved"] == 1
+        mem_id = resp.json()["ids"][0]
+        mem = test_client.get(f"/mcp/get/{mem_id}").json()["memory"]
+        # 与 /mcp/save 一致地做了脱敏（token 模式先命中，整体被替换）
+        assert "REDACTED" in mem["content"]
+        assert "sk-abcdefghijklmnopqrstuvwxyz123456" not in mem["content"]
+
+    def test_batch_save_dedup_matches_save(self, test_client):
+        """同一内容经 save 与 batch_save 两条路径必须互相判重（含首尾空白差异）。"""
+        content = "跨路径去重一致性校验用内容"
+        r1 = test_client.post("/mcp/save", json={"content": content, "source": "system"}).json()
+        assert r1["action"] == "saved"
+        r2 = test_client.post(
+            "/mcp/batch_save",
+            json={"memories": [{"content": "  " + content + "  ", "source": "system"}]},
+        ).json()
+        assert r2["saved"] == 0, "batch_save 未识别出与 save 相同的内容"
+        assert r2["skipped"] == 1
+
+    def test_batch_save_keeps_insights(self, test_client):
+        resp = test_client.post(
+            "/mcp/batch_save",
+            json={"memories": [{"content": "批量保存带结论的记忆", "insights": "批量路径也要保留 insights", "source": "system"}]},
+        ).json()
+        mem = test_client.get(f"/mcp/get/{resp['ids'][0]}").json()["memory"]
+        assert mem["insights"] == "批量路径也要保留 insights"
 
 
 class TestListMemory:

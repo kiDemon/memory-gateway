@@ -57,6 +57,123 @@ from memory_gateway.routers._shared import (
 
 log = logging.getLogger("memory-server")
 
+
+# ── 保存路径公共逻辑（save / batch_save / smart_save 共用）─────
+# 目的：保证多条写入路径行为完全一致（敏感信息过滤、去重指纹、自动标签、
+# TTL/hot_tier、insights/血缘/收敛字段），避免路径漂移导致去重失效或字段丢失。
+
+
+def _prepare_save(req: SaveRequest, now: str, memory_id: str) -> dict:
+    """统一的保存前处理。checksum/simhash 基于最终存储内容计算。"""
+    content = _filter_sensitive(req.content.strip())
+    mem_type = req.type or detect_type(content)
+    priority = req.priority or "P1"
+    source = req.source or "unknown"
+    tags = req.tags
+    auto_tagged = False
+    if not tags:
+        tags = _extract_key_terms(content)[:5]
+        auto_tagged = True
+    return {
+        "id": memory_id,
+        "content": content,
+        "checksum": compute_checksum(content),
+        "simhash": compute_simhash(content),
+        "type": mem_type,
+        "tags_json": json.dumps(tags),
+        "auto_tagged": auto_tagged,
+        "category_id": req.category_id or "general",
+        "priority": priority,
+        "source": source,
+        "scope": req.scope,
+        "confidence": _compute_confidence(mem_type, source, len(content)),
+        "hot_tier": 1 if priority == "P0" or mem_type == "procedural" else 0,
+        "ttl_days": DEFAULT_TTL.get(mem_type) or DEFAULT_TTL.get(priority, 0),
+        "embedding": _compute_embedding(content),
+        "vector_clock": json.dumps({source: now}),
+        "insights": req.insights or "",
+        "derived_from": json.dumps(req.derived_from) if req.derived_from else None,
+        "superseded_by": req.superseded_by,  # 语义 = 本条取代的旧条 ID
+        "session_id": req.session_id,
+    }
+
+
+def _insert_memory(db: sqlite3.Connection, p: dict, now: str) -> int:
+    """INSERT + 会话关联 + 收敛归档 + change_log + 版本快照 + 图谱关系。
+
+    返回 _auto_create_relations 的图谱边数。
+    checksum 唯一索引冲突（并发竞态）时抛 sqlite3.IntegrityError，由调用方决定语义。
+    """
+    db.execute(
+        """INSERT INTO memories
+             (id, content, type, scope, source, priority, confidence, tags, category_id,
+              embedding, hot_tier, ttl_days, vector_clock,
+              created_at, updated_at, recall_count, archived, checksum, simhash,
+              insights, derived_from, superseded_by)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, NULL)""",
+        (p["id"], p["content"], p["type"], p["scope"], p["source"], p["priority"],
+         p["confidence"], p["tags_json"], p["category_id"], p["embedding"],
+         p["hot_tier"], p["ttl_days"], p["vector_clock"], now, now,
+         p["checksum"], p["simhash"], p["insights"], p["derived_from"]),
+    )
+
+    if p["session_id"]:
+        db.execute(
+            "INSERT OR IGNORE INTO session_memories (session_id, memory_id, created_at) VALUES (?, ?, ?)",
+            (p["session_id"], p["id"], now),
+        )
+
+    # 写入侧收敛：superseded_by 参数 = 被取代的旧条 ID，
+    # 旧条 archive + superseded_by 字段（新条ID）写回旧条，追溯链可读。
+    if p["superseded_by"]:
+        old = db.execute(
+            "SELECT id, archived FROM memories WHERE id=?",
+            (p["superseded_by"],),
+        ).fetchone()
+        if old and old["archived"] == 0:
+            db.execute(
+                "UPDATE memories SET archived=1, superseded_by=?, updated_at=? WHERE id=?",
+                (p["id"], now, p["superseded_by"]),
+            )
+            db.execute(
+                "INSERT INTO change_log (memory_id, action, snapshot, timestamp) "
+                "VALUES (?, 'archived_by_supersede', ?, ?)",
+                (p["superseded_by"], f"superseded_by={p['id']}", now),
+            )
+            log.info("save: archived %s (superseded_by=%s)", p["superseded_by"][:8], p["id"][:8])
+
+    db.execute(
+        "INSERT INTO change_log (memory_id, action, snapshot, timestamp) VALUES (?, 'save', ?, ?)",
+        (p["id"], p["content"], now),
+    )
+
+    VersionManager.create_version(
+        db, p["id"], p["content"],
+        change_type="create",
+        changed_by=p["source"],
+        change_reason="Initial memory creation",
+        metadata={"type": p["type"], "category": p["category_id"], "priority": p["priority"]},
+    )
+
+    return _auto_create_relations(db, p["id"], p["content"], p["category_id"])
+
+
+def _bump_recall(db: sqlite3.Connection, ids: list, now: str, gain: float = 0.02) -> None:
+    """检索命中统计：召回 +1、last_recalled 更新、confidence 饱和增长。
+
+    饱和增长（趋近 0.95）：confidence = c + gain*(1-c)，
+    避免高频检索导致 confidence 全体通胀到 1.0 而失去区分度。
+    """
+    if not ids:
+        return
+    placeholders = ",".join("?" for _ in ids)
+    db.execute(
+        f"UPDATE memories SET last_recalled=?, recall_count=recall_count+1, "
+        f"confidence=MIN(0.95, confidence + ? * (1.0 - confidence)) "
+        f"WHERE id IN ({placeholders})",
+        [now, gain] + list(ids),
+    )
+
 router = APIRouter(tags=["memories"])
 
 
@@ -67,25 +184,21 @@ router = APIRouter(tags=["memories"])
 async def save_memory(req: SaveRequest) -> dict:
     memory_id = req.id or str(uuid.uuid4())
     now = now_iso()
-    content = _filter_sensitive(req.content.strip())
-    checksum = compute_checksum(content)
-    simhash = compute_simhash(content)
-    mem_type = req.type or detect_type(content)
-    # Auto-generate tags if empty (None or [])
-    tags = req.tags
-    if not tags:
-        tags = _extract_key_terms(content)[:5]
-        log.info(f"Auto-generated tags for memory {memory_id[:8]}: {tags}")
-    tags_json = json.dumps(tags)
-    category_id = req.category_id or "general"
-    confidence = _compute_confidence(mem_type, req.source or "unknown", len(content))
-    if req.source == "unknown":
+    p = _prepare_save(req, now, memory_id)
+    if p["auto_tagged"]:
+        log.info(f"Auto-generated tags for memory {memory_id[:8]}: {json.loads(p['tags_json'])}")
+    if (req.source or "unknown") == "unknown":
         log.warning(f"Memory {memory_id[:8]} saved with source='unknown'")
 
     with db_conn() as db:
+        if req.id:
+            dup_id = db.execute("SELECT id FROM memories WHERE id=?", (req.id,)).fetchone()
+            if dup_id:
+                raise HTTPException(status_code=409, detail=f"Memory {req.id} already exists")
+
         existing = db.execute(
             "SELECT id, checksum FROM memories WHERE checksum=? AND archived=0",
-            (checksum,),
+            (p["checksum"],),
         ).fetchone()
         if existing:
             return {
@@ -95,7 +208,7 @@ async def save_memory(req: SaveRequest) -> dict:
                 "existing_id": existing["id"],
             }
 
-        near_dup = _find_near_duplicate(db, simhash)
+        near_dup = _find_near_duplicate(db, p["simhash"])
         if near_dup:
             return {
                 "success": True,
@@ -105,72 +218,21 @@ async def save_memory(req: SaveRequest) -> dict:
                 "similarity": near_dup["similarity"],
             }
 
-        embedding_blob = _compute_embedding(content)
-        init_clock = json.dumps({req.source: now})
-
-        is_procedural = mem_type == "procedural"
-        derived_from_json = json.dumps(req.derived_from) if req.derived_from else None
-
-        db.execute(
-           """INSERT INTO memories
-              (id, content, type, scope, source, priority, confidence, tags, category_id,
-                embedding, hot_tier, ttl_days, vector_clock,
-                created_at, updated_at, recall_count, archived, checksum, simhash,
-                derived_from, superseded_by)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?)""",
-           (memory_id, content, mem_type, req.scope,
-            req.source, req.priority or "P1", confidence, tags_json, category_id,
-            embedding_blob,
-            1 if (req.priority or "P1") == "P0" or is_procedural else 0,
-            DEFAULT_TTL.get(mem_type) or DEFAULT_TTL.get(req.priority or "P1", 0),
-            init_clock,
-            now, now, checksum, simhash,
-            derived_from_json, None),  # superseded_by 不写在新条上；旧条 archive 时由收敛段写回
-        )
-
-        VersionManager.create_version(
-            db, memory_id, content,
-            change_type="create",
-            changed_by=req.source,
-            change_reason="Initial memory creation",
-            metadata={"type": mem_type, "category": category_id, "priority": req.priority or "P1"}
-        )
-
-        if req.session_id:
-            db.execute(
-                "INSERT OR IGNORE INTO session_memories (session_id, memory_id, created_at) VALUES (?, ?, ?)",
-                (req.session_id, memory_id, now),
-            )
-
-        # 写入侧收敛：调用方传入 supersedes=旧条 ID 时（新条取代旧条），
-        # 把旧条 archive + 把 superseded_by 字段（新条ID）写回旧条，
-        # 这样旧条默认从 search/list 中排除，而追溯链仍可读（mem_get 可见）。
-        if req.superseded_by:
-            old = db.execute(
-                "SELECT id, archived FROM memories WHERE id=?",
-                (req.superseded_by,),
+        try:
+            graph_edges = _insert_memory(db, p, now)
+        except sqlite3.IntegrityError:
+            # checksum 唯一索引兜底并发竞态：同内容并发写入时后到者按重复跳过
+            existing = db.execute(
+                "SELECT id FROM memories WHERE checksum=? AND archived=0",
+                (p["checksum"],),
             ).fetchone()
-            if old and old["archived"] == 0:
-                db.execute(
-                    "UPDATE memories SET archived=1, superseded_by=?, updated_at=? WHERE id=?",
-                    (memory_id, now, req.superseded_by),
-                )
-                db.execute(
-                    "INSERT INTO change_log (memory_id, action, snapshot, timestamp) "
-                    "VALUES (?, 'archived_by_supersede', ?, ?)",
-                    (req.superseded_by, f"superseded_by={memory_id}", now),
-                )
-                log.info(
-                    "save_memory: archived %s (superseded_by=%s)",
-                    req.superseded_by[:8], memory_id[:8],
-                )
+            return {
+                "success": True,
+                "action": "skipped",
+                "reason": "duplicate",
+                "existing_id": existing["id"] if existing else None,
+            }
 
-        db.execute(
-            "INSERT INTO change_log (memory_id, action, snapshot, timestamp) VALUES (?, 'save', ?, ?)",
-            (memory_id, content, now),
-        )
-
-        graph_edges = _auto_create_relations(db, memory_id, content, category_id)
         _sync_hot_tier_from_cache(db)
         hot_cache.clear()  # 新写入后立即失效搜索缓存
 
@@ -178,9 +240,9 @@ async def save_memory(req: SaveRequest) -> dict:
         "success": True,
         "action": "saved",
         "id": memory_id,
-        "type": mem_type,
+        "type": p["type"],
         "graph_edges": graph_edges,
-        "archived_superseded": req.superseded_by if req.superseded_by else None,
+        "archived_superseded": req.superseded_by or None,
     }
 
 
@@ -291,9 +353,20 @@ def _escape_like(s: str) -> str:
 async def search_memory(req: SearchRequest) -> dict:
     t_start = time.time()
     with db_conn() as db:
-        cache_key = f"search:{req.q}:{req.category_filter}:{req.type_filter}:{req.source_filter}:{req.limit}:{req.include_archived}"
+        cache_key = f"search:{req.q}:{req.category_filter}:{req.type_filter}:{req.source_filter}:{req.scope_filter}:{req.limit}:{req.include_archived}"
         cached = hot_cache.get(cache_key)
         if cached:
+            # 缓存命中也计入召回统计与审计（否则 recall_count 偏低、审计断链）
+            now = now_iso()
+            cached_ids = [r["id"] for r in cached]
+            _bump_recall(db, cached_ids, now)
+            db.execute(
+                "INSERT INTO search_audit_log "
+                "(query, source, result_count, result_ids, latency_ms, search_type, hit_cache) "
+                "VALUES (?, ?, ?, ?, ?, 'cache', 1)",
+                (req.q, req.source_filter or "unknown", len(cached),
+                 json.dumps(cached_ids), round((time.time() - t_start) * 1000, 2)),
+            )
             return {
                 "success": True,
                 "count": len(cached),
@@ -334,7 +407,9 @@ async def search_memory(req: SearchRequest) -> dict:
         where = " AND ".join(conditions)
         q_len = len(req.q)
 
-        if q_len == 1:
+        # trigram 分词器最少需要 3 个字符才能形成 token：
+        # 1-2 字查询（如中文两字词"网关""排班"）走 FTS 只会静默返回空，必须走 LIKE。
+        if q_len <= 2:
             escaped_q = _escape_like(req.q)
             prefix_q = f"{escaped_q}%"
             sql = f"""
@@ -355,48 +430,9 @@ async def search_memory(req: SearchRequest) -> dict:
                     LIMIT ?
                 """
                 rows = db.execute(sql_wide, [like_q] + params + [req.limit]).fetchall()
-                search_type = "like_wide_1char"
+                search_type = "like_wide_short"
             else:
-                search_type = "like_prefix_1char"
-
-        elif q_len == 2:
-            fts_query = f'"{safe_q}"*'
-            sql = f"""
-                SELECT m.*, fts.rank
-                FROM memories_fts fts
-                JOIN memories m ON m.rowid = fts.rowid
-                WHERE memories_fts MATCH ? AND {where}
-                ORDER BY fts.rank
-                LIMIT ?
-            """
-            fts_params = [fts_query] + params + [req.limit]
-            try:
-                rows = db.execute(sql, fts_params).fetchall()
-                search_type = "fts5_prefix_2char"
-            except sqlite3.OperationalError:
-                escaped_q = _escape_like(req.q)
-                prefix_q = f"{escaped_q}%"
-                sql_fallback = f"""
-                    SELECT m.*, 0 as rank
-                    FROM memories m
-                    WHERE m.content LIKE ? ESCAPE '\\' AND {where}
-                    ORDER BY m.created_at DESC
-                    LIMIT ?
-                """
-                rows = db.execute(sql_fallback, [prefix_q] + params + [req.limit]).fetchall()
-                if len(rows) < 5:
-                    like_q = f"%{escaped_q}%"
-                    sql_wide = f"""
-                        SELECT m.*, 0 as rank
-                        FROM memories m
-                        WHERE m.content LIKE ? ESCAPE '\\' AND {where}
-                        ORDER BY m.created_at DESC
-                        LIMIT ?
-                    """
-                    rows = db.execute(sql_wide, [like_q] + params + [req.limit]).fetchall()
-                    search_type = "like_wide_2char"
-                else:
-                    search_type = "like_prefix_2char"
+                search_type = "like_prefix_short"
 
         else:
             fts_query = f'"{safe_q}"*'
@@ -456,13 +492,8 @@ async def search_memory(req: SearchRequest) -> dict:
 
         now = now_iso()
         ids = [r["id"] for r in results]
+        _bump_recall(db, ids, now)
         if ids:
-            placeholders = ",".join("?" for _ in ids)
-            db.execute(
-                f"UPDATE memories SET last_recalled=?, recall_count=recall_count+1, "
-                f"confidence=MIN(1.0, confidence + 0.02) WHERE id IN ({placeholders})",
-                [now] + ids,
-            )
             _sync_hot_tier_from_cache(db)
 
         latency_ms = round((time.time() - t_start) * 1000, 2)
@@ -500,8 +531,9 @@ async def list_memory(req: ListRequest) -> dict:
             conditions[1] = "1=1"
 
         if req.since:
-            conditions.append("created_at >= ?")
-            params.append(req.since)
+            # 增量同步：新创建 + 旧条被更新都要拉到，否则更新过的旧记忆永远同步不到
+            conditions.append("(updated_at >= ? OR created_at >= ?)")
+            params.extend([req.since, req.since])
 
         if req.category_filter:
             if req.category_filter == "work":
@@ -599,30 +631,42 @@ async def search_hybrid(req: SearchHybridRequest) -> dict:
 
         where = " AND ".join(conditions)
 
-        fts_query = f'"{safe_q}"*'
-        sql = f"""
-            SELECT m.*, fts.rank
-            FROM memories_fts fts
-            JOIN memories m ON m.rowid = fts.rowid
-            WHERE memories_fts MATCH ? AND {where}
-            ORDER BY fts.rank
-            LIMIT ?
-        """
-        params_all = [fts_query] + params + [req.limit]
-
-        try:
-            rows = db.execute(sql, params_all).fetchall()
-        except sqlite3.OperationalError:
+        # trigram 最少 3 字符才能成 token：短查询直接 LIKE，FTS 只会静默返回空
+        if len(req.q) < 3:
             escaped_q = _escape_like(req.q)
-            like_q = f"%{escaped_q}%"
-            sql_fallback = f"""
+            sql_short = f"""
                 SELECT m.*, 0 as rank
                 FROM memories m
                 WHERE m.content LIKE ? ESCAPE '\\' AND {where}
                 ORDER BY m.created_at DESC
                 LIMIT ?
             """
-            rows = db.execute(sql_fallback, [like_q] + params + [req.limit]).fetchall()
+            rows = db.execute(sql_short, [f"%{escaped_q}%"] + params + [req.limit]).fetchall()
+        else:
+            fts_query = f'"{safe_q}"*'
+            sql = f"""
+                SELECT m.*, fts.rank
+                FROM memories_fts fts
+                JOIN memories m ON m.rowid = fts.rowid
+                WHERE memories_fts MATCH ? AND {where}
+                ORDER BY fts.rank
+                LIMIT ?
+            """
+            params_all = [fts_query] + params + [req.limit]
+
+            try:
+                rows = db.execute(sql, params_all).fetchall()
+            except sqlite3.OperationalError:
+                escaped_q = _escape_like(req.q)
+                like_q = f"%{escaped_q}%"
+                sql_fallback = f"""
+                    SELECT m.*, 0 as rank
+                    FROM memories m
+                    WHERE m.content LIKE ? ESCAPE '\\' AND {where}
+                    ORDER BY m.created_at DESC
+                    LIMIT ?
+                """
+                rows = db.execute(sql_fallback, [like_q] + params + [req.limit]).fetchall()
 
         query_embedding = _compute_embedding(req.q)
         results = _hybrid_search(db, req.q, query_embedding, list(rows),
@@ -630,27 +674,20 @@ async def search_hybrid(req: SearchHybridRequest) -> dict:
 
         now = now_iso()
         ids = [r["id"] for r in results]
-        if ids:
-            placeholders = ",".join("?" for _ in ids)
-            db.execute(
-                f"UPDATE memories SET last_recalled=?, recall_count=recall_count+1 WHERE id IN ({placeholders})",
-                [now] + ids,
-            )
-            # Update confidence based on recall (same as mem_search)
-            for r in results:
-                new_conf = min(1.0, (r.get("confidence") or 0.8) + 0.01)
-                db.execute("UPDATE memories SET confidence=? WHERE id=?", (new_conf, r["id"]))
-                hot_cache.put(r["id"], r)
+        _bump_recall(db, ids, now)
 
-        # Audit log (same as mem_search)
+        # Audit log（列名与 schema 对齐：result_count / created_at，此前写入永远失败被吞）
         latency_ms = round((time.time() - t_start) * 1000, 2)
         try:
             db.execute(
-                "INSERT INTO search_audit_log (query, results_count, latency_ms, search_type, timestamp) VALUES (?, ?, ?, ?, ?)",
-                (req.q, len(results), latency_ms, "hybrid", now),
+                "INSERT INTO search_audit_log "
+                "(query, source, result_count, result_ids, latency_ms, search_type, hit_cache) "
+                "VALUES (?, ?, ?, ?, ?, 'hybrid', 0)",
+                (req.q, req.source_filter or "unknown", len(results),
+                 json.dumps(ids), latency_ms),
             )
-        except Exception:
-            pass  # non-fatal
+        except sqlite3.Error:
+            log.warning("search_hybrid: audit log write failed", exc_info=True)
 
     return {
         "success": True,
@@ -723,7 +760,11 @@ async def get_memory(memory_id: str) -> dict:
         row = db.execute("SELECT * FROM memories WHERE id=?", (memory_id,)).fetchone()
     if not row:
         raise HTTPException(status_code=404, detail=f"Memory {memory_id} not found")
-    return {"success": True, "memory": row_to_dict(row)}
+    mem = row_to_dict(row)
+    # row_to_dict 为控制列表/搜索响应体积会剔除 insights；
+    # 单条读取时显式带回（自我蒸馏的结论需要可读可追溯）
+    mem["insights"] = row["insights"] if "insights" in row.keys() else None
+    return {"success": True, "memory": mem}
 
 
 @router.put("/mcp/update/{memory_id}")
@@ -738,14 +779,15 @@ async def update_memory(memory_id: str, req: UpdateRequest) -> dict:
         updates = []
         params: list[Any] = []
 
+        content_val = _filter_sensitive(req.content.strip()) if req.content is not None else ""
         if req.content is not None:
             updates.append("content=?")
-            params.append(req.content.strip())
+            params.append(content_val)
             updates.append("checksum=?")
-            params.append(compute_checksum(req.content))
+            params.append(compute_checksum(content_val))
             updates.append("simhash=?")
-            params.append(compute_simhash(req.content))
-            embedding_blob = _compute_embedding(req.content.strip())
+            params.append(compute_simhash(content_val))
+            embedding_blob = _compute_embedding(content_val)
             if embedding_blob:
                 updates.append("embedding=?")
                 params.append(embedding_blob)
@@ -756,18 +798,22 @@ async def update_memory(memory_id: str, req: UpdateRequest) -> dict:
             updates.append("scope=?")
             params.append(req.scope)
         if req.priority is not None:
+            eff_type = req.type or existing["type"]
             updates.append("priority=?")
             params.append(req.priority)
             updates.append("ttl_days=?")
-            params.append(DEFAULT_TTL.get(req.priority, 0))
+            params.append(DEFAULT_TTL.get(eff_type) or DEFAULT_TTL.get(req.priority, 0))
             updates.append("hot_tier=?")
-            params.append(1 if req.priority == "P0" else 0)
+            params.append(1 if req.priority == "P0" or eff_type == "procedural" else 0)
         if req.category_id is not None:
             updates.append("category_id=?")
             params.append(req.category_id)
         if req.tags is not None:
             updates.append("tags=?")
             params.append(json.dumps(req.tags))
+        if req.insights is not None:
+            updates.append("insights=?")
+            params.append(req.insights)
         if req.archived is not None:
             updates.append("archived=?")
             params.append(1 if req.archived else 0)
@@ -780,16 +826,20 @@ async def update_memory(memory_id: str, req: UpdateRequest) -> dict:
 
         sql = f"UPDATE memories SET {', '.join(updates)} WHERE id=?"
         params.append(memory_id)
-        db.execute(sql, params)
+        try:
+            db.execute(sql, params)
+        except sqlite3.IntegrityError:
+            # checksum 唯一约束：更新后内容与现存活跃记忆重复
+            raise HTTPException(status_code=409, detail="checksum 与现存活跃记忆重复（去重约束）")
 
         db.execute(
             "INSERT INTO change_log (memory_id, action, snapshot, timestamp) VALUES (?, 'update', ?, ?)",
-            (memory_id, req.content or "", now_iso()),
+            (memory_id, content_val, now_iso()),
         )
 
         if req.content is not None:
             VersionManager.create_version(
-                db, memory_id, req.content.strip(),
+                db, memory_id, content_val,
                 change_type="update",
                 changed_by="api",
                 change_reason="Content updated via API"
@@ -815,6 +865,9 @@ async def delete_memory(memory_id: str) -> dict:
         db.execute("DELETE FROM session_memories WHERE memory_id=?", (memory_id,))
         db.execute("DELETE FROM change_log WHERE memory_id=?", (memory_id,))
         db.execute("DELETE FROM raw_memories WHERE memory_id=?", (memory_id,))
+        db.execute("DELETE FROM memory_relations WHERE source_id=? OR target_id=?", (memory_id, memory_id))
+        # resolved_contradictions 的 FK 无 ON DELETE CASCADE，不清理会 IntegrityError 500
+        db.execute("DELETE FROM resolved_contradictions WHERE memory_id_a=? OR memory_id_b=?", (memory_id, memory_id))
         db.execute("DELETE FROM memories WHERE id=?", (memory_id,))
 
         log.info(f"Memory {memory_id[:8]}... deleted with all related data")
@@ -1067,86 +1120,37 @@ async def batch_save(req: BatchSaveRequest) -> dict:
     now = now_iso()
 
     with db_conn() as db:
-        memories_params = []
-        session_params = []
-        changelog_params = []
-        version_tasks = []
-
         for mem in req.memories:
             memory_id = mem.id or str(uuid.uuid4())
-            checksum = compute_checksum(mem.content)
-            simhash_val = compute_simhash(mem.content)
-            mem_type = mem.type or detect_type(mem.content)
-            tags_json = json.dumps(mem.tags or [])
-            category_id = mem.category_id or "general"
-            priority = mem.priority or "P1"
+            # 统一走 _prepare_save + _insert_memory：与 /mcp/save 行为完全一致
+            # （敏感信息过滤、自动标签、TTL/hot_tier、insights/血缘/收敛、图谱、版本）
+            p = _prepare_save(mem, now, memory_id)
 
             existing = db.execute(
                 "SELECT id FROM memories WHERE checksum=? AND archived=0",
-                (checksum,),
+                (p["checksum"],),
             ).fetchone()
             if existing:
                 skipped += 1
                 continue
 
-            near_dup = _find_near_duplicate(db, simhash_val)
+            near_dup = _find_near_duplicate(db, p["simhash"])
             if near_dup:
                 skipped += 1
                 continue
 
-            embedding_blob = _compute_embedding(mem.content.strip())
-            init_clock = json.dumps({mem.source: now})
+            try:
+                _insert_memory(db, p, now)
+            except sqlite3.IntegrityError:
+                # checksum 唯一索引兜底：批内/并发重复按跳过处理
+                skipped += 1
+                continue
 
-            content_stripped = mem.content.strip()
-            memories_params.append((
-                memory_id, content_stripped, mem_type, mem.scope,
-                mem.source, priority, tags_json, category_id,
-                embedding_blob,
-                1 if priority == "P0" else 0,
-                DEFAULT_TTL.get(priority, 0),
-                init_clock,
-                now, now, checksum, simhash_val, mem.insights or "",
-            ))
-
-            if mem.session_id:
-                session_params.append((mem.session_id, memory_id, now))
-
-            changelog_params.append((memory_id, 'save', content_stripped, now))
-            version_tasks.append((memory_id, content_stripped, mem.source or "system", mem_type, category_id, priority))
             ids.append(memory_id)
             saved += 1
 
-        if memories_params:
-            db.executemany(
-                """INSERT INTO memories
-                   (id, content, type, scope, source, priority, confidence, tags, category_id,
-                    embedding, hot_tier, ttl_days, vector_clock,
-                    created_at, updated_at, recall_count, archived, checksum, simhash, insights)
-                   VALUES (?, ?, ?, ?, ?, ?, 0.8, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?)""",
-                memories_params,
-            )
-
-        if session_params:
-            db.executemany(
-                "INSERT OR IGNORE INTO session_memories (session_id, memory_id, created_at) VALUES (?, ?, ?)",
-                session_params,
-            )
-
-        if changelog_params:
-            db.executemany(
-                "INSERT INTO change_log (memory_id, action, snapshot, timestamp) VALUES (?, ?, ?, ?)",
-                changelog_params,
-            )
-
-        for mid, content, source, mtype, cat, prio in version_tasks:
-            VersionManager.create_version(
-                db, mid, content,
-                change_type="create",
-                changed_by=source,
-                change_reason="Batch save",
-                metadata={"type": mtype, "category": cat, "priority": prio},
-            )
         if saved > 0:
+            _sync_hot_tier_from_cache(db)
             hot_cache.clear()  # 批量写入后失效搜索缓存
     return {"success": True, "saved": saved, "skipped": skipped, "ids": ids}
 

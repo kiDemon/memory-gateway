@@ -22,10 +22,13 @@ router = APIRouter(prefix="/vault", tags=["vault"])
 
 # ── vault 路径解析 ────────────────────────────────────────
 # 优先级：env OBSIDIAN_VAULT_PATH > 软链 > 默认
-VAULT = Path(
-    os.environ.get("OBSIDIAN_VAULT_PATH")
-    or "/home/kidemon/obsidian-vault"
-).resolve()
+_vault_env = os.environ.get("OBSIDIAN_VAULT_PATH", "").strip()
+if _vault_env:
+    _vault_target = Path(_vault_env).resolve()
+else:
+    _vault_target = Path("/home/kidemon/obsidian-vault").resolve()
+# 路径不存在时显式置 None（不能用 Path()：它是 CWD 且恒为真，会误判启用并扫描工作目录）
+VAULT: Optional[Path] = _vault_target if _vault_target.is_dir() else None
 
 MAX_FILE_BYTES = 1024 * 1024          # 1 MB
 MD_EXT = {".md", ".markdown"}
@@ -35,6 +38,9 @@ _TREE_CACHE: dict[str, tuple[float, list]] = {}      # {root_key: (mtime, tree)}
 _TREE_TTL = 30.0                                     # 秒
 _TREE_BACKLINK_CACHE: dict[str, tuple[float, list]] = {}
 _TREE_BACKLINK_TTL = 60.0
+
+# ── 是否启用 vault 模块 ───────────────────────────────────
+VAULT_ENABLED = VAULT is not None
 
 # ── Markdown 实例（单例）─────────────────────────────────
 _md = md_lib.Markdown(
@@ -53,6 +59,8 @@ _md = md_lib.Markdown(
 
 def _safe_resolve(rel: str) -> Optional[Path]:
     """防 ../ 越权；rel 可以是文件或目录的 vault 相对路径。"""
+    if not VAULT_ENABLED:
+        return None
     # 空路径 → vault 根
     rel = (rel or "").strip().lstrip("/")
     p = (VAULT / rel).resolve() if rel else VAULT
@@ -200,6 +208,9 @@ def _get_tree() -> list[dict]:
 @router.get("/api/tree")
 def api_tree():
     """返回 vault 目录树（JSON）。"""
+    if not VAULT_ENABLED:
+        return JSONResponse({"error": "vault 未启用", "vault": str(_vault_target),
+                             "message": "OBSIDIAN_VAULT_PATH 未配置或路径不存在"}, status_code=503)
     return {"vault": str(VAULT), "tree": _get_tree()}
 
 
@@ -233,6 +244,9 @@ def api_file(path: str = Query("")):
 def api_search(q: str = Query(..., min_length=1), limit: int = 20):
     """轻量全文搜索（文件名 + 内容 substring）。返回 top N。
     注意：vault 只 24 文件、max 5.8KB，没必要上 FTS5。"""
+    if not VAULT_ENABLED:
+        return JSONResponse({"error": "vault 未启用", "vault": str(_vault_target),
+                             "message": "OBSIDIAN_VAULT_PATH 未配置或路径不存在"}, status_code=503)
     q_lower = q.lower()
     hits: list[dict] = []
     for md_file in VAULT.rglob("*.md"):
@@ -268,6 +282,9 @@ def api_search(q: str = Query(..., min_length=1), limit: int = 20):
 @router.get("/api/backlinks")
 def api_backlinks(path: str = Query(...)):
     """反向链接：哪些文件 [[本页]] 或包含本页文件名。"""
+    if not VAULT_ENABLED:
+        return JSONResponse({"error": "vault 未启用", "vault": str(_vault_target),
+                             "message": "OBSIDIAN_VAULT_PATH 未配置或路径不存在"}, status_code=503)
     import time
     now = time.time()
     cached = _TREE_BACKLINK_CACHE.get(path)
@@ -313,7 +330,7 @@ def api_backlinks(path: str = Query(...)):
 def page(path: str = Query("")):
     """渲染单个 markdown 为完整 HTML（服务端）。"""
     # vault 缺失时友好提示
-    if not VAULT.exists() or not VAULT.is_dir():
+    if not VAULT_ENABLED:
         return HTMLResponse(
             f"""<!doctype html><html><head><meta charset=utf-8><title>vault · 配置缺失</title>
             <link rel="stylesheet" href="/static/vault.css"></head>
@@ -409,14 +426,14 @@ fetch('/vault/api/backlinks?path=' + encodeURIComponent(PATH))
 def index(dir: str = Query("")):
     """vault 首页：左侧树 + 当前目录文件列表。"""
     # vault 根缺失 → 给运维友好提示而不是 500
-    if not VAULT.exists() or not VAULT.is_dir():
+    if not VAULT_ENABLED:
         return HTMLResponse(
             f"""<!doctype html><html><head><meta charset=utf-8><title>vault · 配置缺失</title>
             <link rel="stylesheet" href="/static/vault.css"></head>
             <body><div style="max-width:560px;margin:80px auto;padding:0 24px">
             <h1>📚 vault 路径未配置</h1>
             <p>环境变量 <code>OBSIDIAN_VAULT_PATH</code> 指向的目录不存在：</p>
-            <pre style="background:#1a1a1a;padding:12px;border-radius:4px;overflow-x:auto"><code>{VAULT}</code></pre>
+            <pre style="background:#1a1a1a;padding:12px;border-radius:4px;overflow-x:auto"><code>{_vault_target}</code></pre>
             <p>请在服务器侧：</p>
             <ol>
               <li>建目录：<code>mkdir -p /data/memory-gateway/vault</code></li>
@@ -494,7 +511,9 @@ def index(dir: str = Query("")):
 @router.get("/health")
 def vault_health():
     """vault 模块独立健康检查。"""
-    if not VAULT.exists():
-        return JSONResponse({"status": "missing", "vault": str(VAULT)}, status_code=500)
+    if not VAULT_ENABLED:
+        return JSONResponse({"status": "disabled", "vault": str(_vault_target),
+                             "message": "OBSIDIAN_VAULT_PATH 未配置或路径不存在"},
+                            status_code=503)
     md_count = sum(1 for _ in VAULT.rglob("*.md"))
     return {"status": "ok", "vault": str(VAULT), "md_files": md_count}

@@ -116,7 +116,7 @@ class TestCreateCategory:
         assert resp.json()["success"] is True
 
     def test_create_category_with_nonexistent_parent(self, test_client):
-        """This should still succeed (no FK enforcement at app level for parent)."""
+        """父分类不存在时应返回 400（此前抛裸 sqlite3.IntegrityError 变成 500）。"""
         resp = test_client.post(
             "/mcp/categories",
             json={
@@ -125,7 +125,8 @@ class TestCreateCategory:
                 "parent_id": "nonexistent_parent",
             },
         )
-        assert resp.status_code == 200
+        assert resp.status_code == 400
+        assert "parent_id" in resp.json()["detail"]
 
 
 class TestUpdateCategory:
